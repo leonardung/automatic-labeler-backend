@@ -1,35 +1,42 @@
+import io
 import os
+import tempfile
+from contextlib import nullcontext
+
 import cv2
-from django.shortcuts import get_object_or_404
 import numpy as np
 import torch
-import io
 from PIL import Image
-import tempfile
 from django.conf import settings
+from django.core.files.base import ContentFile
 from django.db import transaction
-from rest_framework import viewsets, status, filters
+from django.shortcuts import get_object_or_404
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from segment_anything import SamPredictor, sam_model_registry
-from sam2.build_sam import build_sam2_video_predictor
-from sam2.sam2_video_predictor import SAM2VideoPredictor
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
 from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
 from api.models.project import Project
 from api.serializers import (
     CoordinateSerializer,
-    ProjectSerializer,
     ImageModelSerializer,
+    ProjectSerializer,
 )
-from rest_framework.permissions import IsAuthenticated
-from rest_framework_simplejwt.authentication import JWTAuthentication
-from django.core.files.base import ContentFile
+from sam3.model_builder import build_sam3_video_model
 
-sam = None
-predictor = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+SAM3_CHECKPOINT_PATH = os.getenv("SAM3_CHECKPOINT_PATH")
+SAM3_BPE_PATH = os.getenv("SAM3_BPE_PATH")
+SAM3_LOAD_FROM_HF = SAM3_CHECKPOINT_PATH is None
+
+# These are shared across requests to avoid reloading the model
+sam3_video_model = None
+sam3_inference_states = {}
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -84,13 +91,14 @@ class ImageViewSet(viewsets.ModelViewSet):
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
-    sam_model: SAM2VideoPredictor = None
-    inference_state = None
-
-    torch.autocast(device_type=device, dtype=torch.bfloat16).__enter__()
 
     def get_queryset(self):
         return ImageModel.objects.filter(project__user=self.request.user)
+
+    def _get_autocast_context(self):
+        if device == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
 
     def create(self, request, *args, **kwargs):
         project_id = request.data.get("project_id")
@@ -178,25 +186,39 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def generate_mask(self, request, pk=None):
-        if device == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
         image: ImageModel = self.get_object()
-        if self.__class__.sam_model is None:
-            self.load_model()
-            self.__class__.inference_state = self.__class__.sam_model.init_state(
-                video_path=f"{settings.MEDIA_ROOT}/projects/{image.project.pk}/images"
+        project = image.project
+
+        try:
+            model = self._get_sam3_model()
+            inference_state = self._get_inference_state(project)
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to load SAM3 model: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
         data = request.data
-        coordinates = data.get("coordinates")
-        input_points = np.array([[coord["x"], coord["y"]] for coord in coordinates])
-        input_labels = np.array(
-            [1 if coord.get("include", True) else 0 for coord in coordinates]
+        coordinates = data.get("coordinates") or []
+        if not coordinates:
+            return Response(
+                {"error": "No coordinates provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        width, height = self._get_image_dimensions(image.image.path)
+        normalized_points = np.array(
+            [[coord["x"] / width, coord["y"] / height] for coord in coordinates],
+            dtype=np.float32,
         )
-        # delete existing coordinates
+        input_labels = np.array(
+            [1 if coord.get("include", True) else 0 for coord in coordinates],
+            dtype=np.int32,
+        )
+
+        # Persist the clicked points
         image.coordinates.all().delete()
-        # Create Coordinate objects
-        for i, coord in enumerate(coordinates):
+        for coord in coordinates:
             Coordinate.objects.create(
                 image=image,
                 x=coord["x"],
@@ -204,85 +226,102 @@ class ImageViewSet(viewsets.ModelViewSet):
                 include=coord.get("include", True),
             )
 
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            _, out_obj_ids, out_mask_logits = (
-                self.__class__.sam_model.add_new_points_or_box(
-                    inference_state=self.__class__.inference_state,
-                    frame_idx=int(image.image.name.split(".jpg")[0].split("/")[-1]),
-                    obj_id=0,
-                    points=input_points,
-                    labels=input_labels,
-                )
+        frame_idx = self._frame_index_from_name(image.image.name)
+        obj_id = data.get("obj_id", 0)
+
+        with self._get_autocast_context():
+            _, outputs = model.add_prompt(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                points=normalized_points.tolist(),
+                point_labels=input_labels.tolist(),
+                obj_id=obj_id,
             )
-        binary_mask = (out_mask_logits[0] > 0.0).cpu().numpy()[0]
-        mask_image = Image.fromarray((binary_mask * 255).astype(np.int8), mode="L")
+
+        if outputs is None or outputs.get("out_binary_masks") is None:
+            return Response(
+                {"error": "SAM3 did not return any masks"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        binary_masks = outputs["out_binary_masks"]
+        if len(binary_masks) == 0:
+            return Response(
+                {"error": "SAM3 did not return any masks"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        mask_array = binary_masks[0].astype(np.uint8) * 255
+        mask_image = Image.fromarray(mask_array, mode="L")
         temp_buffer = io.BytesIO()
         mask_image.save(temp_buffer, format="PNG")
         temp_buffer.seek(0)
         if image.mask:
             image.mask.delete(save=False)
         image.mask.save(
-            image.image.name.split(".jpg")[0].split("/")[-1] + ".png",
+            f"{self._frame_stem(image.image.name)}.png",
             ContentFile(temp_buffer.read()),
-            save=True,  # This will write to disk and update the model
+            save=True,
         )
-        # return image object with mask
         serializer = ImageModelSerializer(image, context={"request": request})
         return Response(serializer.data)
 
     @action(detail=False, methods=["post"])
     def propagate_mask(self, request):
         project = request.data.get("project_id")
+        if not project:
+            return Response(
+                {"error": "project_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         project_images = ImageModel.objects.filter(project=project)
         video_segments = {}
-        if device == "cuda" and torch.cuda.get_device_properties(0).major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+        try:
+            model = self._get_sam3_model()
+            inference_state = self._get_inference_state(
+                get_object_or_404(Project, id=project)
+            )
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to load SAM3 model: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            for (
-                out_frame_idx,
-                out_obj_ids,
-                out_mask_logits,
-            ) in self.sam_model.propagate_in_video(
-                self.inference_state, start_frame_idx=0
+        with self._get_autocast_context():
+            for out_frame_idx, outputs in model.propagate_in_video(
+                inference_state=inference_state,
+                start_frame_idx=0,
+                max_frame_num_to_track=None,
+                reverse=False,
             ):
-                masks = {
-                    out_obj_id: (out_mask_logits[i] > 0.0)
-                    .squeeze()
-                    .cpu()
-                    .numpy()
-                    .astype(np.int8)
-                    for i, out_obj_id in enumerate(out_obj_ids)
+                if outputs is None:
+                    continue
+                masks = outputs.get("out_binary_masks")
+                obj_ids = outputs.get("out_obj_ids")
+                if masks is None or len(masks) == 0:
+                    continue
+                video_segments[out_frame_idx] = {
+                    obj_ids[i]: masks[i] for i in range(len(masks))
                 }
-                video_segments[out_frame_idx] = masks
                 matching_image = project_images.filter(
                     image__endswith=f"{out_frame_idx:05d}.jpg"
                 ).first()
                 if not matching_image:
                     continue
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    binary_mask = (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
-                    mask_image = Image.fromarray(
-                        (binary_mask * 255).astype(np.uint8), mode="L"
-                    )
-                    temp_buffer = io.BytesIO()
-                    mask_image.save(temp_buffer, format="PNG")
-                    temp_buffer.seek(0)
-                    # filename = f"mask_{out_frame_idx:05d}.png"
-                    # if len(out_obj_ids) > 1:
-                    #     filename = f"mask_{out_frame_idx:05d}_{out_obj_id}.png"
-                    if matching_image.mask:
-                        matching_image.mask.delete(save=False)
-                    matching_image.mask.save(
-                        matching_image.image.name.split(".jpg")[0].split("/")[-1]
-                        + ".png",
-                        ContentFile(temp_buffer.read()),
-                        save=True,
-                    )
-            self.sam_model.reset_state(self.inference_state)
+                binary_mask = masks[0].astype(np.uint8) * 255
+                mask_image = Image.fromarray(binary_mask, mode="L")
+                temp_buffer = io.BytesIO()
+                mask_image.save(temp_buffer, format="PNG")
+                temp_buffer.seek(0)
+                if matching_image.mask:
+                    matching_image.mask.delete(save=False)
+                matching_image.mask.save(
+                    f"{self._frame_stem(matching_image.image.name)}.png",
+                    ContentFile(temp_buffer.read()),
+                    save=True,
+                )
+            model.reset_state(inference_state)
 
-        # return all images with masks
         serializer = ImageModelSerializer(
             project_images, many=True, context={"request": request}
         )
@@ -290,13 +329,14 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
-        if self.__class__.sam_model is not None:
-            self.__class__.sam_model = None
+        global sam3_video_model, sam3_inference_states
+        if sam3_video_model is not None:
+            sam3_video_model = None
+            sam3_inference_states = {}
             if device == "cuda":
                 torch.cuda.empty_cache()
-            return Response({"message": "Model unloaded successfully"})
-        else:
-            return Response({"message": "Model is not loaded"})
+            return Response({"message": "SAM3 model unloaded"})
+        return Response({"message": "Model is not loaded"})
 
     @action(detail=True, methods=["delete"])
     def delete_mask(self, request, pk=None):
@@ -311,16 +351,45 @@ class ImageViewSet(viewsets.ModelViewSet):
         image.coordinates.all().delete()
         return Response({"detail": "Coordinates have been deleted."})
 
-    def load_model(self):
-        if self.__class__.sam_model is None:
-            try:
-                sam_checkpoint = "./ml_models/sam_models/sam2.1_hiera_small.pt"
-                model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
-                self.__class__.sam_model = build_sam2_video_predictor(
-                    model_cfg, sam_checkpoint, device=device
-                )
-            except Exception as e:
-                raise e
+    @staticmethod
+    def _get_sam3_model():
+        global sam3_video_model
+        if sam3_video_model is None:
+            sam3_video_model = build_sam3_video_model(
+                checkpoint_path=SAM3_CHECKPOINT_PATH,
+                bpe_path=SAM3_BPE_PATH,
+                load_from_HF=SAM3_LOAD_FROM_HF,
+                device=device,
+            )
+        return sam3_video_model
+
+    def _get_inference_state(self, project: Project):
+        if project.pk not in sam3_inference_states:
+            project_frames = os.path.join(
+                settings.MEDIA_ROOT, "projects", str(project.pk), "images"
+            )
+            sam3_inference_states[project.pk] = self._get_sam3_model().init_state(
+                resource_path=project_frames,
+                offload_video_to_cpu=device != "cuda",
+                async_loading_frames=False,
+            )
+        return sam3_inference_states[project.pk]
+
+    @staticmethod
+    def _get_image_dimensions(image_path: str):
+        with Image.open(image_path) as img:
+            return img.size
+
+    @staticmethod
+    def _frame_index_from_name(path: str) -> int:
+        try:
+            return int(ImageViewSet._frame_stem(path))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _frame_stem(path: str) -> str:
+        return os.path.splitext(os.path.basename(path))[0]
 
 
 class VideoViewSet(viewsets.ViewSet):
@@ -415,30 +484,15 @@ class ModelManagerViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["post"])
     def load_model(self, request):
-        global sam, predictor
-        if sam is None:
-            try:
-                sam_checkpoint = "./ml_models/sam_models/sam_vit_h_4b8939.pth"
-                model_type = "vit_h"
-                sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
-                sam.to(device=device)
-                predictor = SamPredictor(sam)
-                return Response({"message": "Model loaded successfully"})
-            except Exception as e:
-                return Response(
-                    {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-        else:
-            return Response({"message": "Model is already loaded"})
+        try:
+            ImageViewSet._get_sam3_model()
+            return Response({"message": "SAM3 model loaded"})
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to load SAM3: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     @action(detail=False, methods=["post"])
     def unload_model(self, request):
-        global sam, predictor
-        if sam is not None:
-            sam = None
-            predictor = None
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            return Response({"message": "Model unloaded successfully"})
-        else:
-            return Response({"message": "Model is not loaded"})
+        return ImageViewSet.unload_model(self, request)
