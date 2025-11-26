@@ -92,6 +92,18 @@ class ImageViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
 
+    def _ensure_frame_cache_initialized(self, inference_state):
+        """
+        SAM3 tracker expects a cached entry per frame before propagation/refinement.
+        If the cache is empty (e.g., right after reset_state), pre-seed it with
+        empty dicts for every frame to avoid assertion errors during propagation.
+        """
+        cached = inference_state.get("cached_frame_outputs")
+        if cached is None:
+            return
+        for idx in range(inference_state.get("num_frames", 0)):
+            cached.setdefault(idx, {})
+
     def get_queryset(self):
         return ImageModel.objects.filter(project__user=self.request.user)
 
@@ -229,6 +241,8 @@ class ImageViewSet(viewsets.ModelViewSet):
         frame_idx = self._frame_index_from_name(image.image.name)
         obj_id = data.get("obj_id", 0)
 
+        self._ensure_frame_cache_initialized(inference_state)
+
         with self._get_autocast_context():
             # The tracker expects a cached entry for the frame when refining/adding points.
             inference_state["cached_frame_outputs"].setdefault(frame_idx, {})
@@ -289,6 +303,8 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        self._ensure_frame_cache_initialized(inference_state)
+
         with self._get_autocast_context():
             for out_frame_idx, outputs in model.propagate_in_video(
                 inference_state=inference_state,
@@ -332,13 +348,18 @@ class ImageViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
         global sam3_video_model, sam3_inference_states
-        if sam3_video_model is not None:
-            sam3_video_model = None
-            sam3_inference_states = {}
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            return Response({"message": "SAM3 model unloaded"})
-        return Response({"message": "Model is not loaded"})
+        sam3_video_model = None
+        sam3_inference_states = {}
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        try:
+            sam3_video_model = self._get_sam3_model()
+        except Exception as exc:  # pragma: no cover - defensive path
+            return Response(
+                {"error": f"Model reset failed: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return Response({"message": "SAM3 model reset (unloaded and reloaded)"})
 
     @action(detail=True, methods=["delete"])
     def delete_mask(self, request, pk=None):
@@ -375,7 +396,9 @@ class ImageViewSet(viewsets.ModelViewSet):
                 offload_video_to_cpu=device != "cuda",
                 async_loading_frames=False,
             )
-        return sam3_inference_states[project.pk]
+        inference_state = sam3_inference_states[project.pk]
+        self._ensure_frame_cache_initialized(inference_state)
+        return inference_state
 
     @staticmethod
     def _get_image_dimensions(image_path: str):
