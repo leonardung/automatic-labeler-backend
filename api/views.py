@@ -2,6 +2,7 @@ import io
 import os
 import tempfile
 from contextlib import nullcontext
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -203,7 +204,7 @@ class ImageViewSet(viewsets.ModelViewSet):
 
         try:
             model = self._get_sam3_model()
-            inference_state = self._get_inference_state(project)
+            inference_state = self._get_inference_state(project, image=image)
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -284,19 +285,23 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def propagate_mask(self, request):
-        project = request.data.get("project_id")
-        if not project:
+        project_id = request.data.get("project_id")
+        if not project_id:
             return Response(
                 {"error": "project_id is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        project_images = ImageModel.objects.filter(project=project)
+        project_images = ImageModel.objects.filter(project=project_id)
         video_segments = {}
+        project_obj = get_object_or_404(Project, id=project_id)
+        if project_obj.type == "segmentation":
+            return Response(
+                {"error": "Mask propagation is only supported for video tracking projects."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
             model = self._get_sam3_model()
-            inference_state = self._get_inference_state(
-                get_object_or_404(Project, id=project)
-            )
+            inference_state = self._get_inference_state(project_obj)
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -386,17 +391,55 @@ class ImageViewSet(viewsets.ModelViewSet):
             )
         return sam3_video_model
 
-    def _get_inference_state(self, project: Project):
-        if project.pk not in sam3_inference_states:
-            project_frames = os.path.join(
-                settings.MEDIA_ROOT, "projects", str(project.pk), "images"
-            )
-            sam3_inference_states[project.pk] = self._get_sam3_model().init_state(
-                resource_path=project_frames,
-                offload_video_to_cpu=device != "cuda",
-                async_loading_frames=False,
-            )
-        inference_state = sam3_inference_states[project.pk]
+    def _get_inference_state(
+        self, project: Project, image: Optional[ImageModel] = None
+    ):
+        """
+        For simple segmentation projects, only load the single active image into SAM3
+        so switching images resets the model and avoids loading all project images.
+        Video tracking projects keep a project-level state for propagation across frames.
+        """
+        cache_entry = sam3_inference_states.get(project.pk)
+        # Normalize legacy cache shape (plain inference_state) into a dict
+        if cache_entry is not None and not isinstance(cache_entry, dict):
+            cache_entry = {"state": cache_entry}
+
+        if project.type == "segmentation":
+            if image is None:
+                raise ValueError("Image is required for segmentation inference state")
+            if (
+                not cache_entry
+                or cache_entry.get("project_type") != "segmentation"
+                or cache_entry.get("image_id") != image.pk
+            ):
+                inference_state = self._get_sam3_model().init_state(
+                    resource_path=image.image.path,
+                    offload_video_to_cpu=device != "cuda",
+                    async_loading_frames=False,
+                )
+                cache_entry = {
+                    "project_type": "segmentation",
+                    "image_id": image.pk,
+                    "state": inference_state,
+                }
+                sam3_inference_states[project.pk] = cache_entry
+        else:
+            if cache_entry is None or cache_entry.get("project_type") != project.type:
+                project_frames = os.path.join(
+                    settings.MEDIA_ROOT, "projects", str(project.pk), "images"
+                )
+                inference_state = self._get_sam3_model().init_state(
+                    resource_path=project_frames,
+                    offload_video_to_cpu=device != "cuda",
+                    async_loading_frames=False,
+                )
+                cache_entry = {
+                    "project_type": project.type,
+                    "state": inference_state,
+                }
+                sam3_inference_states[project.pk] = cache_entry
+
+        inference_state = cache_entry["state"]
         self._ensure_frame_cache_initialized(inference_state)
         return inference_state
 
