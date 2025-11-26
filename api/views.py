@@ -20,9 +20,11 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
+from api.models.mask import MaskCategory, SegmentationMask
 from api.models.project import Project
 from api.serializers import (
     ImageModelSerializer,
+    MaskCategorySerializer,
     ProjectSerializer,
 )
 from sam3.model_builder import build_sam3_video_model
@@ -56,12 +58,12 @@ class ProjectViewSet(viewsets.ModelViewSet):
         Deletes the mask files for all images associated with this project.
         """
         project = self.get_object()
-        project_images = ImageModel.objects.filter(project=project)
-        count = 0
-        for image in project_images:
-            if image.mask:
-                image.mask.delete(save=True)
-                count += 1
+        masks = SegmentationMask.objects.filter(image__project=project)
+        count = masks.count()
+        for m in masks:
+            if m.mask:
+                m.mask.delete(save=False)
+        masks.delete()
         return Response(
             {"detail": f"Deleted masks for {count} images in the project."},
             status=status.HTTP_200_OK,
@@ -84,12 +86,39 @@ class ProjectViewSet(viewsets.ModelViewSet):
         )
 
 
+class MaskCategoryViewSet(viewsets.ModelViewSet):
+    queryset = MaskCategory.objects.all()
+    serializer_class = MaskCategorySerializer
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get_queryset(self):
+        return MaskCategory.objects.filter(project__user=self.request.user)
+
+    def perform_create(self, serializer):
+        project_id = self.request.data.get("project_id")
+        project = get_object_or_404(Project, id=project_id, user=self.request.user)
+        serializer.save(project=project)
+
+
 class ImageViewSet(viewsets.ModelViewSet):
     queryset = ImageModel.objects.all()
     serializer_class = ImageModelSerializer
     parser_classes = (MultiPartParser, FormParser, JSONParser)
     permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
+
+    @staticmethod
+    def _resolve_category(project: Project, category_id):
+        if category_id:
+            return get_object_or_404(
+                MaskCategory, id=category_id, project=project
+            )
+        # fallback/default category
+        category, _ = MaskCategory.objects.get_or_create(
+            project=project, name="Default", defaults={"color": "#00c800"}
+        )
+        return category
 
     def _ensure_frame_cache_initialized(self, inference_state):
         """
@@ -146,6 +175,15 @@ class ImageViewSet(viewsets.ModelViewSet):
     def generate_mask(self, request, pk=None):
         image: ImageModel = self.get_object()
         project = image.project
+        data = request.data
+        coordinates = data.get("coordinates") or []
+        if not coordinates:
+            return Response(
+                {"error": "No coordinates provided"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        category = self._resolve_category(project, data.get("category_id"))
 
         try:
             model = self._get_sam3_model()
@@ -154,14 +192,6 @@ class ImageViewSet(viewsets.ModelViewSet):
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-        data = request.data
-        coordinates = data.get("coordinates") or []
-        if not coordinates:
-            return Response(
-                {"error": "No coordinates provided"},
-                status=status.HTTP_400_BAD_REQUEST,
             )
 
         width, height = self._get_image_dimensions(image.image.path)
@@ -174,23 +204,12 @@ class ImageViewSet(viewsets.ModelViewSet):
             dtype=np.int32,
         )
 
-        # Persist the clicked points
-        image.coordinates.all().delete()
-        for coord in coordinates:
-            Coordinate.objects.create(
-                image=image,
-                x=coord["x"],
-                y=coord["y"],
-                include=coord.get("include", True),
-            )
-
         frame_idx = self._frame_index_from_name(image.image.name)
         obj_id = data.get("obj_id", 0)
 
         self._ensure_frame_cache_initialized(inference_state)
 
         with self._get_autocast_context():
-            # The tracker expects a cached entry for the frame when refining/adding points.
             inference_state["cached_frame_outputs"].setdefault(frame_idx, {})
             _, outputs = model.add_prompt(
                 inference_state=inference_state,
@@ -218,19 +237,26 @@ class ImageViewSet(viewsets.ModelViewSet):
         temp_buffer = io.BytesIO()
         mask_image.save(temp_buffer, format="PNG")
         temp_buffer.seek(0)
-        if image.mask:
-            image.mask.delete(save=False)
-        image.mask.save(
+
+        segmentation_mask, _ = SegmentationMask.objects.get_or_create(
+            image=image, category=category
+        )
+        if segmentation_mask.mask:
+            segmentation_mask.mask.delete(save=False)
+        segmentation_mask.points = coordinates
+        segmentation_mask.mask.save(
             f"{self._frame_stem(image.image.name)}.png",
             ContentFile(temp_buffer.read()),
             save=True,
         )
+        segmentation_mask.save(update_fields=["points"])
         serializer = ImageModelSerializer(image, context={"request": request})
         return Response(serializer.data)
 
     @action(detail=False, methods=["post"])
     def propagate_mask(self, request):
         project_id = request.data.get("project_id")
+        category_id = request.data.get("category_id")
         if not project_id:
             return Response(
                 {"error": "project_id is required"},
@@ -247,6 +273,7 @@ class ImageViewSet(viewsets.ModelViewSet):
         try:
             model = self._get_sam3_model()
             inference_state = self._get_inference_state(project_obj)
+            category = self._resolve_category(project_obj, category_id)
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -281,9 +308,12 @@ class ImageViewSet(viewsets.ModelViewSet):
                 temp_buffer = io.BytesIO()
                 mask_image.save(temp_buffer, format="PNG")
                 temp_buffer.seek(0)
-                if matching_image.mask:
-                    matching_image.mask.delete(save=False)
-                matching_image.mask.save(
+                seg_mask, _ = SegmentationMask.objects.get_or_create(
+                    image=matching_image, category=category
+                )
+                if seg_mask.mask:
+                    seg_mask.mask.delete(save=False)
+                seg_mask.mask.save(
                     f"{self._frame_stem(matching_image.image.name)}.png",
                     ContentFile(temp_buffer.read()),
                     save=True,
@@ -314,9 +344,17 @@ class ImageViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["delete"])
     def delete_mask(self, request, pk=None):
         image: ImageModel = self.get_object()
-        if image.mask:
-            image.mask.delete(save=True)
-        return Response({"detail": "Mask has been deleted."})
+        category_id = request.query_params.get("category_id")
+        masks_qs = image.masks.all()
+        if category_id:
+            masks_qs = masks_qs.filter(category_id=category_id)
+        deleted = 0
+        for m in masks_qs:
+            if m.mask:
+                m.mask.delete(save=False)
+            m.delete()
+            deleted += 1
+        return Response({"detail": f"Deleted {deleted} mask(s)."})
 
     @action(detail=True, methods=["delete"])
     def delete_coordinates(self, request, pk=None):

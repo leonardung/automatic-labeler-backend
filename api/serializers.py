@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
+from api.models.mask import MaskCategory, SegmentationMask
 from api.models.project import Project
 
 
@@ -16,8 +17,26 @@ class CoordinateSerializer(serializers.ModelSerializer):
         return obj.image.id
 
 
+class MaskCategorySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MaskCategory
+        fields = ["id", "name", "color"]
+
+
+class SegmentationMaskSerializer(serializers.ModelSerializer):
+    category = MaskCategorySerializer(read_only=True)
+    category_id = serializers.PrimaryKeyRelatedField(
+        queryset=MaskCategory.objects.all(), source="category", write_only=True
+    )
+
+    class Meta:
+        model = SegmentationMask
+        fields = ["id", "mask", "points", "category", "category_id"]
+
+
 class ImageModelSerializer(serializers.ModelSerializer):
     coordinates = CoordinateSerializer(many=True, read_only=True)
+    masks = SegmentationMaskSerializer(many=True, read_only=True)
 
     class Meta:
         model = ImageModel
@@ -25,17 +44,18 @@ class ImageModelSerializer(serializers.ModelSerializer):
             "id",
             "image",
             "thumbnail",
-            "mask",
             "uploaded_at",
             "coordinates",
             "is_label",
             "original_filename",
+            "masks",
         ]
 
 
 class ProjectSerializer(serializers.ModelSerializer):
     images = ImageModelSerializer(many=True, read_only=True)
+    categories = MaskCategorySerializer(many=True, read_only=True)
 
     class Meta:
         model = Project
-        fields = ["id", "name", "type", "images"]
+        fields = ["id", "name", "type", "images", "categories"]
