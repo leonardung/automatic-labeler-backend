@@ -111,9 +111,7 @@ class ImageViewSet(viewsets.ModelViewSet):
     @staticmethod
     def _resolve_category(project: Project, category_id):
         if category_id:
-            return get_object_or_404(
-                MaskCategory, id=category_id, project=project
-            )
+            return get_object_or_404(MaskCategory, id=category_id, project=project)
         # fallback/default category
         category, _ = MaskCategory.objects.get_or_create(
             project=project, name="Default", defaults={"color": "#00c800"}
@@ -205,8 +203,14 @@ class ImageViewSet(viewsets.ModelViewSet):
         )
 
         frame_idx = self._frame_index_from_name(image.image.name)
-        obj_id = data.get("obj_id", 0)
-
+        obj_id = data.get("obj_id")
+        if obj_id is None:
+            # Use category id as a stable obj_id so multiple masks can co-exist
+            obj_id = category.id
+        try:
+            obj_id = int(obj_id)
+        except (TypeError, ValueError):
+            obj_id = category.id
         self._ensure_frame_cache_initialized(inference_state)
 
         with self._get_autocast_context():
@@ -225,14 +229,40 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        binary_masks = outputs["out_binary_masks"]
-        if len(binary_masks) == 0:
+        masks = outputs.get("out_binary_masks")
+        obj_ids = outputs.get("out_obj_ids")
+
+        # Normalize to Python lists
+        if torch.is_tensor(masks):
+            masks = masks.detach().cpu().numpy()
+        if isinstance(masks, np.ndarray):
+            masks = list(masks)
+        if torch.is_tensor(obj_ids):
+            obj_ids = obj_ids.detach().cpu().numpy()
+        if isinstance(obj_ids, np.ndarray):
+            obj_ids = obj_ids.tolist()
+        if obj_ids is None:
+            obj_ids = []
+
+        if masks is None or len(masks) == 0:
             return Response(
                 {"error": "SAM3 did not return any masks"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        mask_array = binary_masks[0].astype(np.uint8) * 255
+        # Select the mask corresponding to this obj_id (fallback to first)
+        selected_idx = 0
+        try:
+            selected_idx = next(
+                i for i, oid in enumerate(obj_ids) if int(oid) == int(obj_id)
+            )
+        except StopIteration:
+            selected_idx = 0
+
+        mask_arr = masks[selected_idx]
+        if torch.is_tensor(mask_arr):
+            mask_arr = mask_arr.detach().cpu().numpy()
+        mask_array = (mask_arr > 0).astype(np.uint8) * 255
         mask_image = Image.fromarray(mask_array, mode="L")
         temp_buffer = io.BytesIO()
         mask_image.save(temp_buffer, format="PNG")
@@ -263,17 +293,25 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         project_images = ImageModel.objects.filter(project=project_id)
-        video_segments = {}
         project_obj = get_object_or_404(Project, id=project_id)
         if project_obj.type == "segmentation":
             return Response(
-                {"error": "Mask propagation is only supported for video tracking projects."},
+                {
+                    "error": "Mask propagation is only supported for video tracking projects."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
             model = self._get_sam3_model()
             inference_state = self._get_inference_state(project_obj)
-            category = self._resolve_category(project_obj, category_id)
+            categories_by_id = {
+                c.id: c for c in MaskCategory.objects.filter(project=project_obj)
+            }
+            default_category = categories_by_id.get(
+                category_id
+            ) or self._resolve_category(project_obj, category_id)
+            if default_category.id not in categories_by_id:
+                categories_by_id[default_category.id] = default_category
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -293,31 +331,48 @@ class ImageViewSet(viewsets.ModelViewSet):
                     continue
                 masks = outputs.get("out_binary_masks")
                 obj_ids = outputs.get("out_obj_ids")
-                if masks is None or len(masks) == 0:
+                if masks is None or obj_ids is None:
                     continue
-                video_segments[out_frame_idx] = {
-                    obj_ids[i]: masks[i] for i in range(len(masks))
-                }
+
+                # Normalize possible tensor/ndarray outputs into Python lists
+                if torch.is_tensor(masks):
+                    masks = masks.detach().cpu().numpy()
+                if isinstance(masks, np.ndarray):
+                    masks = list(masks)
+                if torch.is_tensor(obj_ids):
+                    obj_ids = obj_ids.detach().cpu().numpy()
+                if isinstance(obj_ids, np.ndarray):
+                    obj_ids = obj_ids.tolist()
+
                 matching_image = project_images.filter(
                     image__endswith=f"{out_frame_idx:05d}.jpg"
                 ).first()
-                if not matching_image:
+                if not matching_image or len(masks) == 0:
                     continue
-                binary_mask = masks[0].astype(np.uint8) * 255
-                mask_image = Image.fromarray(binary_mask, mode="L")
-                temp_buffer = io.BytesIO()
-                mask_image.save(temp_buffer, format="PNG")
-                temp_buffer.seek(0)
-                seg_mask, _ = SegmentationMask.objects.get_or_create(
-                    image=matching_image, category=category
-                )
-                if seg_mask.mask:
-                    seg_mask.mask.delete(save=False)
-                seg_mask.mask.save(
-                    f"{self._frame_stem(matching_image.image.name)}.png",
-                    ContentFile(temp_buffer.read()),
-                    save=True,
-                )
+
+                # SAM3 returns one mask per tracked object; persist them all
+                for idx, obj_id in enumerate(obj_ids):
+                    if idx >= len(masks):
+                        continue
+                    category = categories_by_id.get(int(obj_id), default_category)
+                    mask_arr = masks[idx]
+                    if torch.is_tensor(mask_arr):
+                        mask_arr = mask_arr.detach().cpu().numpy()
+                    binary_mask = (mask_arr > 0).astype(np.uint8) * 255
+                    mask_image = Image.fromarray(binary_mask, mode="L")
+                    temp_buffer = io.BytesIO()
+                    mask_image.save(temp_buffer, format="PNG")
+                    temp_buffer.seek(0)
+                    seg_mask, _ = SegmentationMask.objects.get_or_create(
+                        image=matching_image, category=category
+                    )
+                    if seg_mask.mask:
+                        seg_mask.mask.delete(save=False)
+                    seg_mask.mask.save(
+                        f"{self._frame_stem(matching_image.image.name)}.png",
+                        ContentFile(temp_buffer.read()),
+                        save=True,
+                    )
             model.reset_state(inference_state)
 
         serializer = ImageModelSerializer(
