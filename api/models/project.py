@@ -3,9 +3,6 @@ from django.contrib.auth.models import User
 
 class Project(models.Model):
     PROJECT_TYPE_CHOICES = [
-        ("point_coordinate", "Point Coordinate"),
-        ("multi_point_coordinate", "Multi Point Coordinate"),
-        ("bounding_box", "Bounding Box"),
         ("segmentation", "Segmentation"),
         ("video_tracking_segmentation", "Video Tracking Segmentation"),
     ]

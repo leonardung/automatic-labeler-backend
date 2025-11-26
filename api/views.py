@@ -10,7 +10,6 @@ import torch
 from PIL import Image
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -23,7 +22,6 @@ from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
 from api.models.project import Project
 from api.serializers import (
-    CoordinateSerializer,
     ImageModelSerializer,
     ProjectSerializer,
 )
@@ -143,59 +141,6 @@ class ImageViewSet(viewsets.ModelViewSet):
             image_records, many=True, context={"request": request}
         )
         return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    @action(detail=False, methods=["get"])
-    def folder_coordinates(self, request):
-        folder_path = request.query_params.get("folder_path")
-        if not folder_path:
-            return Response(
-                {"error": "folder_path query parameter is required"}, status=400
-            )
-
-        images = ImageModel.objects.filter(folder_path=folder_path)
-        all_coordinates = []
-        for image in images:
-            coordinates = image.coordinates.all()
-            serializer = CoordinateSerializer(coordinates, many=True)
-            all_coordinates.extend(serializer.data)
-
-        return Response(all_coordinates)
-
-    @action(detail=False, methods=["post"])
-    def save_all_coordinates(self, request):
-        all_coordinates = request.data
-        if not all_coordinates:
-            return Response(
-                {"error": "No coordinates provided"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        with transaction.atomic():
-            for item in all_coordinates:
-                image_id = item.get("image_id")
-                coordinates = item.get("coordinates", [])
-
-                # Validate coordinates exist
-                if not coordinates:
-                    continue
-
-                # Fetch the image
-                try:
-                    image = ImageModel.objects.get(id=image_id)
-                except ImageModel.DoesNotExist:
-                    continue
-
-                # Delete existing coordinates for the image
-                image.coordinates.all().delete()
-
-                # Create new coordinate objects
-                coordinate_objs = [
-                    Coordinate(image=image, x=coord["x"], y=coord["y"])
-                    for coord in coordinates
-                ]
-                Coordinate.objects.bulk_create(coordinate_objs)
-
-        return Response({"status": "success"}, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def generate_mask(self, request, pk=None):

@@ -32,9 +32,6 @@ class Migration(migrations.Migration):
                     "type",
                     models.CharField(
                         choices=[
-                            ("point_coordinate", "Point Coordinate"),
-                            ("multi_point_coordinate", "Multi Point Coordinate"),
-                            ("bounding_box", "Bounding Box"),
                             ("segmentation", "Segmentation"),
                             (
                                 "video_tracking_segmentation",
