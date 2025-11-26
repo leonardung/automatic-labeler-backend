@@ -230,6 +230,8 @@ class ImageViewSet(viewsets.ModelViewSet):
         obj_id = data.get("obj_id", 0)
 
         with self._get_autocast_context():
+            # The tracker expects a cached entry for the frame when refining/adding points.
+            inference_state["cached_frame_outputs"].setdefault(frame_idx, {})
             _, outputs = model.add_prompt(
                 inference_state=inference_state,
                 frame_idx=frame_idx,
