@@ -294,6 +294,7 @@ class ImageViewSet(viewsets.ModelViewSet):
         project = image.project
         prompt = (request.data.get("prompt") or "").strip()
         max_masks = request.data.get("max_masks") or 1
+        threshold = request.data.get("threshold", 0.5)
 
         if not prompt:
             return Response(
@@ -305,6 +306,12 @@ class ImageViewSet(viewsets.ModelViewSet):
             max_masks = max(1, int(max_masks))
         except (TypeError, ValueError):
             max_masks = 1
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        threshold = min(1.0, max(0.01, threshold))
+        prompt_base = self._sanitize_prompt_base(prompt)
 
         try:
             _, processor = self._get_sam3_image_components()
@@ -315,7 +322,8 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Clear any prior prompts while reusing the encoded image features
+        # Apply user-provided threshold and clear prior prompts while reusing encoded image
+        processor.set_confidence_threshold(threshold, inference_state)
         processor.reset_all_prompts(inference_state)
         with self._get_autocast_context():
             outputs = processor.set_text_prompt(prompt=prompt, state=inference_state)
@@ -323,21 +331,11 @@ class ImageViewSet(viewsets.ModelViewSet):
         masks = outputs.get("masks")
         scores = outputs.get("scores")
 
-        # If nothing came back, relax confidence and try once more
-        if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
-            processor.set_confidence_threshold(0.05, inference_state)
-            processor.reset_all_prompts(inference_state)
-            with self._get_autocast_context():
-                outputs = processor.set_text_prompt(
-                    prompt=prompt, state=inference_state
-                )
-
-        masks = outputs.get("masks")
-        scores = outputs.get("scores")
-
         if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
             return Response(
-                {"error": "SAM3 did not return any masks for this prompt."},
+                {
+                    "error": "SAM3 did not return any masks for this prompt. Try lowering the threshold."
+                },
                 status=status.HTTP_404_NOT_FOUND,
             )
 
@@ -349,9 +347,16 @@ class ImageViewSet(viewsets.ModelViewSet):
         mask_list = list(masks)
         if not mask_list:
             return Response(
-                {"error": "SAM3 did not return any masks for this prompt."},
+                {
+                    "error": "SAM3 did not return any masks for this prompt. Try lowering the threshold."
+                },
                 status=status.HTTP_404_NOT_FOUND,
             )
+
+        # Remove any prior categories created from this prompt base before adding new ones
+        MaskCategory.objects.filter(
+            project=project, name__startswith=f"{prompt_base}_"
+        ).delete()
 
         score_list = scores if isinstance(scores, list) else [1.0] * len(mask_list)
         ordered_indices = sorted(
@@ -366,7 +371,7 @@ class ImageViewSet(viewsets.ModelViewSet):
         created_categories = []
         for local_idx, mask_idx in enumerate(ordered_indices[: max_masks or 1]):
             category_name = self._next_category_name(
-                base_name=prompt, existing_names=existing_names, start_at=local_idx
+                base_name=prompt_base, existing_names=existing_names, start_at=local_idx
             )
             existing_names.add(category_name)
             color = self._color_for_index(len(existing_names))
@@ -571,6 +576,10 @@ class ImageViewSet(viewsets.ModelViewSet):
         return f"rgba({r},{g},{b},0.6)"
 
     @staticmethod
+    def _sanitize_prompt_base(name: str) -> str:
+        return (name.replace("\n", " ").strip() or "prompt")[:200]
+
+    @staticmethod
     def _next_category_name(
         base_name: str, existing_names: set[str], start_at: int
     ) -> str:
@@ -579,8 +588,7 @@ class ImageViewSet(viewsets.ModelViewSet):
         unique constraint on categories.
         """
         idx = start_at
-        sanitized = base_name.replace("\n", " ").strip() or "prompt"
-        sanitized = sanitized[:200]  # leave room for suffix
+        sanitized = ImageViewSet._sanitize_prompt_base(base_name)
         while True:
             candidate = f"{sanitized}_{idx}"
             if candidate not in existing_names:
