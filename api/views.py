@@ -1,3 +1,4 @@
+import colorsys
 import io
 import os
 import tempfile
@@ -27,7 +28,8 @@ from api.serializers import (
     MaskCategorySerializer,
     ProjectSerializer,
 )
-from sam3.model_builder import build_sam3_video_model
+from sam3.model.sam3_image_processor import Sam3Processor
+from sam3.model_builder import build_sam3_image_model, build_sam3_video_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -38,6 +40,9 @@ SAM3_LOAD_FROM_HF = SAM3_CHECKPOINT_PATH is None
 # These are shared across requests to avoid reloading the model
 sam3_video_model = None
 sam3_inference_states = {}
+sam3_image_model = None
+sam3_image_processor = None
+sam3_image_states = {}
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -283,6 +288,139 @@ class ImageViewSet(viewsets.ModelViewSet):
         serializer = ImageModelSerializer(image, context={"request": request})
         return Response(serializer.data)
 
+    @action(detail=True, methods=["post"])
+    def generate_text_mask(self, request, pk=None):
+        image: ImageModel = self.get_object()
+        project = image.project
+        prompt = (request.data.get("prompt") or "").strip()
+        max_masks = request.data.get("max_masks") or 1
+
+        if not prompt:
+            return Response(
+                {"error": "A text prompt is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            max_masks = max(1, int(max_masks))
+        except (TypeError, ValueError):
+            max_masks = 1
+
+        try:
+            _, processor = self._get_sam3_image_components()
+            inference_state = self._get_text_inference_state(image)
+        except Exception as exc:
+            return Response(
+                {"error": f"Failed to load SAM3 image model: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # Clear any prior prompts while reusing the encoded image features
+        processor.reset_all_prompts(inference_state)
+        with self._get_autocast_context():
+            outputs = processor.set_text_prompt(prompt=prompt, state=inference_state)
+
+        masks = outputs.get("masks")
+        scores = outputs.get("scores")
+
+        # If nothing came back, relax confidence and try once more
+        if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
+            processor.set_confidence_threshold(0.05, inference_state)
+            processor.reset_all_prompts(inference_state)
+            with self._get_autocast_context():
+                outputs = processor.set_text_prompt(
+                    prompt=prompt, state=inference_state
+                )
+
+        masks = outputs.get("masks")
+        scores = outputs.get("scores")
+
+        if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
+            return Response(
+                {"error": "SAM3 did not return any masks for this prompt."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if torch.is_tensor(masks):
+            masks = masks.detach().cpu()
+        if torch.is_tensor(scores):
+            scores = scores.detach().cpu().tolist()
+
+        mask_list = list(masks)
+        if not mask_list:
+            return Response(
+                {"error": "SAM3 did not return any masks for this prompt."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        score_list = scores if isinstance(scores, list) else [1.0] * len(mask_list)
+        ordered_indices = sorted(
+            range(len(mask_list)),
+            key=lambda idx: float(score_list[idx]) if idx < len(score_list) else 0,
+            reverse=True,
+        )
+
+        existing_names = set(
+            MaskCategory.objects.filter(project=project).values_list("name", flat=True)
+        )
+        created_categories = []
+        for local_idx, mask_idx in enumerate(ordered_indices[: max_masks or 1]):
+            category_name = self._next_category_name(
+                base_name=prompt, existing_names=existing_names, start_at=local_idx
+            )
+            existing_names.add(category_name)
+            color = self._color_for_index(len(existing_names))
+            category = MaskCategory.objects.create(
+                project=project, name=category_name, color=color
+            )
+            created_categories.append(category)
+
+            mask_arr = mask_list[mask_idx]
+            if torch.is_tensor(mask_arr):
+                mask_arr = mask_arr.detach().cpu().numpy()
+
+            if isinstance(mask_arr, np.ndarray):
+                mask_arr = np.squeeze(mask_arr)
+                if mask_arr.ndim > 2:
+                    # Fallback: take the first channel if squeezing still leaves depth
+                    mask_arr = mask_arr[..., 0]
+            binary_mask = (mask_arr > 0).astype(np.uint8) * 255
+            mask_image = Image.fromarray(binary_mask, mode="L")
+            temp_buffer = io.BytesIO()
+            mask_image.save(temp_buffer, format="PNG")
+            temp_buffer.seek(0)
+
+            segmentation_mask, _ = SegmentationMask.objects.get_or_create(
+                image=image, category=category
+            )
+            if segmentation_mask.mask:
+                segmentation_mask.mask.delete(save=False)
+            segmentation_mask.points = []
+            segmentation_mask.mask.save(
+                f"{self._frame_stem(image.image.name)}_{category.id}.png",
+                ContentFile(temp_buffer.read()),
+                save=True,
+            )
+            segmentation_mask.save(update_fields=["points"])
+
+        refreshed_image = ImageModel.objects.get(pk=image.pk)
+        image_data = ImageModelSerializer(
+            refreshed_image, context={"request": request}
+        ).data
+        category_data = MaskCategorySerializer(
+            MaskCategory.objects.filter(project=project), many=True
+        ).data
+
+        return Response(
+            {
+                "image": image_data,
+                "categories": category_data,
+                "created_categories": MaskCategorySerializer(
+                    created_categories, many=True
+                ).data,
+            }
+        )
+
     @action(detail=False, methods=["post"])
     def propagate_mask(self, request):
         project_id = request.data.get("project_id")
@@ -382,13 +520,17 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
-        global sam3_video_model, sam3_inference_states
+        global sam3_video_model, sam3_inference_states, sam3_image_model, sam3_image_processor, sam3_image_states
         sam3_video_model = None
         sam3_inference_states = {}
+        sam3_image_model = None
+        sam3_image_processor = None
+        sam3_image_states = {}
         if device == "cuda":
             torch.cuda.empty_cache()
         try:
             sam3_video_model = self._get_sam3_model()
+            sam3_image_model, sam3_image_processor = self._get_sam3_image_components()
         except Exception as exc:  # pragma: no cover - defensive path
             return Response(
                 {"error": f"Model reset failed: {exc}"},
@@ -418,6 +560,34 @@ class ImageViewSet(viewsets.ModelViewSet):
         return Response({"detail": "Coordinates have been deleted."})
 
     @staticmethod
+    def _color_for_index(index: int) -> str:
+        """
+        Generate a visually distinct color. Uses a golden-ratio hue step so
+        successive calls produce separated hues and includes a gentle alpha
+        for nicer overlays on the frontend.
+        """
+        hue = (index * 0.61803398875) % 1.0
+        r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(hue, 0.65, 0.95)]
+        return f"rgba({r},{g},{b},0.6)"
+
+    @staticmethod
+    def _next_category_name(
+        base_name: str, existing_names: set[str], start_at: int
+    ) -> str:
+        """
+        Generate the next available <prompt>_<id> name while respecting the
+        unique constraint on categories.
+        """
+        idx = start_at
+        sanitized = base_name.replace("\n", " ").strip() or "prompt"
+        sanitized = sanitized[:200]  # leave room for suffix
+        while True:
+            candidate = f"{sanitized}_{idx}"
+            if candidate not in existing_names:
+                return candidate
+            idx += 1
+
+    @staticmethod
     def _get_sam3_model():
         global sam3_video_model
         if sam3_video_model is None:
@@ -428,6 +598,24 @@ class ImageViewSet(viewsets.ModelViewSet):
                 device=device,
             )
         return sam3_video_model
+
+    @staticmethod
+    def _get_sam3_image_components():
+        global sam3_image_model, sam3_image_processor
+        if sam3_image_model is None:
+            sam3_image_model = build_sam3_image_model(
+                checkpoint_path=SAM3_CHECKPOINT_PATH,
+                bpe_path=SAM3_BPE_PATH,
+                load_from_HF=SAM3_LOAD_FROM_HF,
+                device=device,
+            )
+        if sam3_image_processor is None:
+            sam3_image_processor = Sam3Processor(
+                sam3_image_model,
+                device=device,
+                confidence_threshold=0.1,
+            )
+        return sam3_image_model, sam3_image_processor
 
     def _get_inference_state(
         self, project: Project, image: Optional[ImageModel] = None
@@ -480,6 +668,21 @@ class ImageViewSet(viewsets.ModelViewSet):
         inference_state = cache_entry["state"]
         self._ensure_frame_cache_initialized(inference_state)
         return inference_state
+
+    def _get_text_inference_state(self, image: ImageModel):
+        """
+        Maintain a cached inference state for image-level text prompting so we
+        only encode the image once per request cycle.
+        """
+        cache_entry = sam3_image_states.get(image.pk)
+        image_path = image.image.path
+        if cache_entry is None or cache_entry.get("image_path") != image_path:
+            _, processor = self._get_sam3_image_components()
+            with Image.open(image_path) as pil_image:
+                state = processor.set_image(pil_image.convert("RGB"))
+            cache_entry = {"image_path": image_path, "state": state}
+            sam3_image_states[image.pk] = cache_entry
+        return cache_entry["state"]
 
     @staticmethod
     def _get_image_dimensions(image_path: str):
@@ -592,7 +795,8 @@ class ModelManagerViewSet(viewsets.ViewSet):
     def load_model(self, request):
         try:
             ImageViewSet._get_sam3_model()
-            return Response({"message": "SAM3 model loaded"})
+            ImageViewSet._get_sam3_image_components()
+            return Response({"message": "SAM3 models loaded"})
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3: {exc}"},
