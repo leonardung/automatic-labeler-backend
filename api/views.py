@@ -421,9 +421,13 @@ class ImageViewSet(viewsets.ModelViewSet):
 
             # Track obj_id mapping so future point prompts refine this object
             try:
-                obj_id_value = obj_ids[mask_idx] if obj_ids and mask_idx < len(obj_ids) else None
+                obj_id_value = (
+                    obj_ids[mask_idx] if obj_ids and mask_idx < len(obj_ids) else None
+                )
                 if obj_id_value is not None:
-                    sam3_text_obj_map.setdefault(project.id, {})[category.id] = int(obj_id_value)
+                    sam3_text_obj_map.setdefault(project.id, {})[category.id] = int(
+                        obj_id_value
+                    )
             except Exception:
                 pass
 
@@ -545,23 +549,18 @@ class ImageViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
         global sam3_video_model, sam3_inference_states, sam3_image_model, sam3_image_processor, sam3_image_states, sam3_text_obj_map
-        sam3_video_model = None
         sam3_inference_states = {}
-        sam3_image_model = None
-        sam3_image_processor = None
         sam3_image_states = {}
         sam3_text_obj_map = {}
+        # Keep models resident; just clear caches and GPU memory where possible.
+        if sam3_video_model is not None:
+            try:
+                sam3_video_model.reset_state()
+            except Exception:
+                pass
         if device == "cuda":
             torch.cuda.empty_cache()
-        try:
-            sam3_video_model = self._get_sam3_model()
-            sam3_image_model, sam3_image_processor = self._get_sam3_image_components()
-        except Exception as exc:  # pragma: no cover - defensive path
-            return Response(
-                {"error": f"Model reset failed: {exc}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-        return Response({"message": "SAM3 model reset (unloaded and reloaded)"})
+        return Response({"message": "SAM3 caches cleared; model kept loaded"})
 
     @action(detail=True, methods=["delete"])
     def delete_mask(self, request, pk=None):
