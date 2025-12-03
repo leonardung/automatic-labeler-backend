@@ -43,6 +43,7 @@ sam3_inference_states = {}
 sam3_image_model = None
 sam3_image_processor = None
 sam3_image_states = {}
+sam3_text_obj_map = {}
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -210,8 +211,8 @@ class ImageViewSet(viewsets.ModelViewSet):
         frame_idx = self._frame_index_from_name(image.image.name)
         obj_id = data.get("obj_id")
         if obj_id is None:
-            # Use category id as a stable obj_id so multiple masks can co-exist
-            obj_id = category.id
+            # Prefer obj_id from a prior text prompt for the same category
+            obj_id = sam3_text_obj_map.get(project.id, {}).get(category.id, category.id)
         try:
             obj_id = int(obj_id)
         except (TypeError, ValueError):
@@ -314,22 +315,30 @@ class ImageViewSet(viewsets.ModelViewSet):
         prompt_base = self._sanitize_prompt_base(prompt)
 
         try:
-            _, processor = self._get_sam3_image_components()
-            inference_state = self._get_text_inference_state(image)
+            model = self._get_sam3_model()
+            inference_state = self._get_inference_state(project, image=image)
         except Exception as exc:
             return Response(
-                {"error": f"Failed to load SAM3 image model: {exc}"},
+                {"error": f"Failed to load SAM3 model: {exc}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Apply user-provided threshold and clear prior prompts while reusing encoded image
-        processor.set_confidence_threshold(threshold, inference_state)
-        processor.reset_all_prompts(inference_state)
-        with self._get_autocast_context():
-            outputs = processor.set_text_prompt(prompt=prompt, state=inference_state)
+        self._ensure_frame_cache_initialized(inference_state)
+        frame_idx = self._frame_index_from_name(image.image.name)
+        inference_state["cached_frame_outputs"].setdefault(frame_idx, {})
 
-        masks = outputs.get("masks")
-        scores = outputs.get("scores")
+        # Apply user-provided threshold; the tracker uses this value during forward pass
+        inference_state["tracker_confidence_threshold"] = threshold
+        with self._get_autocast_context():
+            _, outputs = model.add_prompt(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                text_str=prompt,
+            )
+
+        masks = outputs.get("out_binary_masks") if outputs else None
+        scores = outputs.get("out_obj_scores") if outputs else None
+        obj_ids = outputs.get("out_obj_ids") if outputs else None
 
         if masks is None or (torch.is_tensor(masks) and masks.numel() == 0):
             return Response(
@@ -343,6 +352,8 @@ class ImageViewSet(viewsets.ModelViewSet):
             masks = masks.detach().cpu()
         if torch.is_tensor(scores):
             scores = scores.detach().cpu().tolist()
+        if torch.is_tensor(obj_ids):
+            obj_ids = obj_ids.detach().cpu().tolist()
 
         mask_list = list(masks)
         if not mask_list:
@@ -407,6 +418,14 @@ class ImageViewSet(viewsets.ModelViewSet):
                 save=True,
             )
             segmentation_mask.save(update_fields=["points"])
+
+            # Track obj_id mapping so future point prompts refine this object
+            try:
+                obj_id_value = obj_ids[mask_idx] if obj_ids and mask_idx < len(obj_ids) else None
+                if obj_id_value is not None:
+                    sam3_text_obj_map.setdefault(project.id, {})[category.id] = int(obj_id_value)
+            except Exception:
+                pass
 
         refreshed_image = ImageModel.objects.get(pk=image.pk)
         image_data = ImageModelSerializer(
@@ -525,12 +544,13 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
-        global sam3_video_model, sam3_inference_states, sam3_image_model, sam3_image_processor, sam3_image_states
+        global sam3_video_model, sam3_inference_states, sam3_image_model, sam3_image_processor, sam3_image_states, sam3_text_obj_map
         sam3_video_model = None
         sam3_inference_states = {}
         sam3_image_model = None
         sam3_image_processor = None
         sam3_image_states = {}
+        sam3_text_obj_map = {}
         if device == "cuda":
             torch.cuda.empty_cache()
         try:
