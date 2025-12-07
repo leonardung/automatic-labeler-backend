@@ -43,6 +43,7 @@ sam3_video_model = None
 sam3_video_states = {}
 sam3_text_obj_map = {}
 sam3_obj_category_map = {}
+propagation_progress = {}
 log = logging.getLogger(__name__)
 
 
@@ -468,8 +469,8 @@ class ImageViewSet(viewsets.ModelViewSet):
                 {"error": "project_id is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        project_images = ImageModel.objects.filter(project=project_id)
-        project_obj = get_object_or_404(Project, id=project_id)
+        project_obj = get_object_or_404(Project, id=project_id, user=request.user)
+        project_images = ImageModel.objects.filter(project=project_obj)
         if project_obj.type == "segmentation":
             return Response(
                 {
@@ -513,73 +514,106 @@ class ImageViewSet(viewsets.ModelViewSet):
             )
 
         self._ensure_frame_cache_initialized(inference_state)
-
+        total_frames = project_images.count()
+        if total_frames == 0:
+            return Response(
+                {"error": "No frames available to propagate masks."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        self._set_propagation_progress(project_obj.id, 0, total_frames, "running")
+        processed_frames = 0
         with self._get_autocast_context():
-            for out_frame_idx, outputs in model.propagate_in_video(
-                inference_state=inference_state,
-                start_frame_idx=0,
-                max_frame_num_to_track=None,
-                reverse=False,
-            ):
-                if outputs is None:
-                    log.warning("[propagate] frame=%s outputs=None", out_frame_idx)
-                    continue
-                masks = outputs.get("out_binary_masks")
-                obj_ids = outputs.get("out_obj_ids")
-                if masks is None or obj_ids is None:
-                    log.warning(
-                        "[propagate] frame=%s missing masks/obj_ids (masks=%s obj_ids=%s)",
-                        out_frame_idx,
-                        type(masks).__name__ if masks is not None else None,
-                        type(obj_ids).__name__ if obj_ids is not None else None,
+            try:
+                for out_frame_idx, outputs in model.propagate_in_video(
+                    inference_state=inference_state,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=None,
+                    reverse=False,
+                ):
+                    processed_frames += 1
+                    self._set_propagation_progress(
+                        project_obj.id, processed_frames, total_frames, "running"
                     )
-                    continue
-
-                # Normalize possible tensor/ndarray outputs into Python lists
-                if torch.is_tensor(masks):
-                    masks = masks.detach().cpu().numpy()
-                if isinstance(masks, np.ndarray):
-                    masks = list(masks)
-                if torch.is_tensor(obj_ids):
-                    obj_ids = obj_ids.detach().cpu().numpy()
-                if isinstance(obj_ids, np.ndarray):
-                    obj_ids = obj_ids.tolist()
-
-                matching_image = project_images.filter(
-                    image__endswith=f"{out_frame_idx:05d}.jpg"
-                ).first()
-                if not matching_image or len(masks) == 0:
-                    log.warning(
-                        "[propagate] frame=%s no matching image (%s) or masks empty",
-                        out_frame_idx,
-                        bool(matching_image),
-                    )
-                    continue
-
-                # SAM3 returns one mask per tracked object; persist them all
-                for idx, obj_id in enumerate(obj_ids):
-                    if idx >= len(masks):
+                    if outputs is None:
+                        log.warning("[propagate] frame=%s outputs=None", out_frame_idx)
                         continue
-                    category = categories_by_id.get(int(obj_id), default_category)
-                    mask_arr = masks[idx]
-                    if torch.is_tensor(mask_arr):
-                        mask_arr = mask_arr.detach().cpu().numpy()
-                    binary_mask = (mask_arr > 0).astype(np.uint8) * 255
-                    mask_image = Image.fromarray(binary_mask, mode="L")
-                    temp_buffer = io.BytesIO()
-                    mask_image.save(temp_buffer, format="PNG")
-                    temp_buffer.seek(0)
-                    seg_mask, _ = SegmentationMask.objects.get_or_create(
-                        image=matching_image, category=category
-                    )
-                    if seg_mask.mask:
-                        seg_mask.mask.delete(save=False)
-                    seg_mask.mask.save(
-                        f"{self._frame_stem(matching_image.image.name)}.png",
-                        ContentFile(temp_buffer.read()),
-                        save=True,
-                    )
-            model.reset_state(inference_state)
+                    masks = outputs.get("out_binary_masks")
+                    obj_ids = outputs.get("out_obj_ids")
+                    if masks is None or obj_ids is None:
+                        log.warning(
+                            "[propagate] frame=%s missing masks/obj_ids (masks=%s obj_ids=%s)",
+                            out_frame_idx,
+                            type(masks).__name__ if masks is not None else None,
+                            type(obj_ids).__name__ if obj_ids is not None else None,
+                        )
+                        continue
+
+                    # Normalize possible tensor/ndarray outputs into Python lists
+                    if torch.is_tensor(masks):
+                        masks = masks.detach().cpu().numpy()
+                    if isinstance(masks, np.ndarray):
+                        masks = list(masks)
+                    if torch.is_tensor(obj_ids):
+                        obj_ids = obj_ids.detach().cpu().numpy()
+                    if isinstance(obj_ids, np.ndarray):
+                        obj_ids = obj_ids.tolist()
+
+                    matching_image = project_images.filter(
+                        image__endswith=f"{out_frame_idx:05d}.jpg"
+                    ).first()
+                    if not matching_image or len(masks) == 0:
+                        log.warning(
+                            "[propagate] frame=%s no matching image (%s) or masks empty",
+                            out_frame_idx,
+                            bool(matching_image),
+                        )
+                        continue
+
+                    # SAM3 returns one mask per tracked object; persist them all
+                    for idx, obj_id in enumerate(obj_ids):
+                        if idx >= len(masks):
+                            continue
+                        category = categories_by_id.get(int(obj_id), default_category)
+                        mask_arr = masks[idx]
+                        if torch.is_tensor(mask_arr):
+                            mask_arr = mask_arr.detach().cpu().numpy()
+                        binary_mask = (mask_arr > 0).astype(np.uint8) * 255
+                        mask_image = Image.fromarray(binary_mask, mode="L")
+                        temp_buffer = io.BytesIO()
+                        mask_image.save(temp_buffer, format="PNG")
+                        temp_buffer.seek(0)
+                        seg_mask, _ = SegmentationMask.objects.get_or_create(
+                            image=matching_image, category=category
+                        )
+                        if seg_mask.mask:
+                            seg_mask.mask.delete(save=False)
+                        seg_mask.mask.save(
+                            f"{self._frame_stem(matching_image.image.name)}.png",
+                            ContentFile(temp_buffer.read()),
+                            save=True,
+                        )
+            except Exception as exc:
+                self._set_propagation_progress(
+                    project_obj.id,
+                    processed_frames,
+                    total_frames,
+                    "failed",
+                    detail=str(exc),
+                )
+                log.exception("Propagation failed for project %s", project_obj.id)
+                return Response(
+                    {"error": f"Failed to propagate masks: {exc}"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            finally:
+                try:
+                    model.reset_state(inference_state)
+                except Exception:
+                    pass
+
+        self._set_propagation_progress(
+            project_obj.id, total_frames, total_frames, "completed"
+        )
 
         serializer = ImageModelSerializer(
             project_images, many=True, context={"request": request}
@@ -622,6 +656,25 @@ class ImageViewSet(viewsets.ModelViewSet):
         image: ImageModel = self.get_object()
         image.coordinates.all().delete()
         return Response({"detail": "Coordinates have been deleted."})
+
+    @action(detail=False, methods=["get"])
+    def propagation_progress(self, request):
+        """
+        Returns the current propagation progress for a project so the frontend
+        can poll. Always starts at 0 for a new run.
+        """
+        project_id = request.query_params.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        project = get_object_or_404(Project, id=project_id, user=request.user)
+        progress_payload = propagation_progress.get(
+            project.id,
+            {"progress": 0, "current": 0, "total": 0, "status": "idle"},
+        )
+        return Response(progress_payload)
 
     @staticmethod
     def _color_for_index(index: int) -> str:
@@ -733,6 +786,25 @@ class ImageViewSet(viewsets.ModelViewSet):
     @staticmethod
     def _frame_stem(path: str) -> str:
         return os.path.splitext(os.path.basename(path))[0]
+
+    @staticmethod
+    def _set_propagation_progress(
+        project_id: int,
+        current: int,
+        total: int,
+        status_str: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        safe_total = max(1, int(total or 0))
+        safe_current = min(max(int(current), 0), safe_total)
+        percent = int((safe_current / safe_total) * 100)
+        propagation_progress[project_id] = {
+            "progress": percent,
+            "current": safe_current,
+            "total": safe_total,
+            "status": status_str,
+            "detail": detail,
+        }
 
 
 class VideoViewSet(viewsets.ViewSet):
