@@ -28,8 +28,7 @@ from api.serializers import (
     MaskCategorySerializer,
     ProjectSerializer,
 )
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model, build_sam3_video_model
+from sam3.model_builder import build_sam3_video_model
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -38,11 +37,9 @@ SAM3_BPE_PATH = os.getenv("SAM3_BPE_PATH")
 SAM3_LOAD_FROM_HF = SAM3_CHECKPOINT_PATH is None
 
 # These are shared across requests to avoid reloading the model
+# SAM3 video tracker (used for both video tracking and per-image prompts)
 sam3_video_model = None
-sam3_inference_states = {}
-sam3_image_model = None
-sam3_image_processor = None
-sam3_image_states = {}
+sam3_video_states = {}
 sam3_text_obj_map = {}
 
 
@@ -190,8 +187,8 @@ class ImageViewSet(viewsets.ModelViewSet):
         category = self._resolve_category(project, data.get("category_id"))
 
         try:
-            model = self._get_sam3_model()
-            inference_state = self._get_inference_state(project, image=image)
+            model = self._get_sam3_video_model()
+            inference_state = self._get_video_inference_state(project, image=image)
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -315,8 +312,8 @@ class ImageViewSet(viewsets.ModelViewSet):
         prompt_base = self._sanitize_prompt_base(prompt)
 
         try:
-            model = self._get_sam3_model()
-            inference_state = self._get_inference_state(project, image=image)
+            model = self._get_sam3_video_model()
+            inference_state = self._get_video_inference_state(project, image=image)
         except Exception as exc:
             return Response(
                 {"error": f"Failed to load SAM3 model: {exc}"},
@@ -468,8 +465,8 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            model = self._get_sam3_model()
-            inference_state = self._get_inference_state(project_obj)
+            model = self._get_sam3_video_model()
+            inference_state = self._get_video_inference_state(project_obj)
             categories_by_id = {
                 c.id: c for c in MaskCategory.objects.filter(project=project_obj)
             }
@@ -548,9 +545,8 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
-        global sam3_video_model, sam3_inference_states, sam3_image_model, sam3_image_processor, sam3_image_states, sam3_text_obj_map
-        sam3_inference_states = {}
-        sam3_image_states = {}
+        global sam3_video_model, sam3_video_states, sam3_text_obj_map
+        sam3_video_states = {}
         sam3_text_obj_map = {}
         # Keep models resident; just clear caches and GPU memory where possible.
         if sam3_video_model is not None:
@@ -615,7 +611,7 @@ class ImageViewSet(viewsets.ModelViewSet):
             idx += 1
 
     @staticmethod
-    def _get_sam3_model():
+    def _get_sam3_video_model():
         global sam3_video_model
         if sam3_video_model is None:
             sam3_video_model = build_sam3_video_model(
@@ -626,25 +622,7 @@ class ImageViewSet(viewsets.ModelViewSet):
             )
         return sam3_video_model
 
-    @staticmethod
-    def _get_sam3_image_components():
-        global sam3_image_model, sam3_image_processor
-        if sam3_image_model is None:
-            sam3_image_model = build_sam3_image_model(
-                checkpoint_path=SAM3_CHECKPOINT_PATH,
-                bpe_path=SAM3_BPE_PATH,
-                load_from_HF=SAM3_LOAD_FROM_HF,
-                device=device,
-            )
-        if sam3_image_processor is None:
-            sam3_image_processor = Sam3Processor(
-                sam3_image_model,
-                device=device,
-                confidence_threshold=0.1,
-            )
-        return sam3_image_model, sam3_image_processor
-
-    def _get_inference_state(
+    def _get_video_inference_state(
         self, project: Project, image: Optional[ImageModel] = None
     ):
         """
@@ -652,7 +630,7 @@ class ImageViewSet(viewsets.ModelViewSet):
         so switching images resets the model and avoids loading all project images.
         Video tracking projects keep a project-level state for propagation across frames.
         """
-        cache_entry = sam3_inference_states.get(project.pk)
+        cache_entry = sam3_video_states.get(project.pk)
         # Normalize legacy cache shape (plain inference_state) into a dict
         if cache_entry is not None and not isinstance(cache_entry, dict):
             cache_entry = {"state": cache_entry}
@@ -665,7 +643,7 @@ class ImageViewSet(viewsets.ModelViewSet):
                 or cache_entry.get("project_type") != "segmentation"
                 or cache_entry.get("image_id") != image.pk
             ):
-                inference_state = self._get_sam3_model().init_state(
+                inference_state = self._get_sam3_video_model().init_state(
                     resource_path=image.image.path,
                     offload_video_to_cpu=device != "cuda",
                     async_loading_frames=False,
@@ -675,13 +653,13 @@ class ImageViewSet(viewsets.ModelViewSet):
                     "image_id": image.pk,
                     "state": inference_state,
                 }
-                sam3_inference_states[project.pk] = cache_entry
+                sam3_video_states[project.pk] = cache_entry
         else:
             if cache_entry is None or cache_entry.get("project_type") != project.type:
                 project_frames = os.path.join(
                     settings.MEDIA_ROOT, "projects", str(project.pk), "images"
                 )
-                inference_state = self._get_sam3_model().init_state(
+                inference_state = self._get_sam3_video_model().init_state(
                     resource_path=project_frames,
                     offload_video_to_cpu=device != "cuda",
                     async_loading_frames=False,
@@ -690,26 +668,11 @@ class ImageViewSet(viewsets.ModelViewSet):
                     "project_type": project.type,
                     "state": inference_state,
                 }
-                sam3_inference_states[project.pk] = cache_entry
+                sam3_video_states[project.pk] = cache_entry
 
         inference_state = cache_entry["state"]
         self._ensure_frame_cache_initialized(inference_state)
         return inference_state
-
-    def _get_text_inference_state(self, image: ImageModel):
-        """
-        Maintain a cached inference state for image-level text prompting so we
-        only encode the image once per request cycle.
-        """
-        cache_entry = sam3_image_states.get(image.pk)
-        image_path = image.image.path
-        if cache_entry is None or cache_entry.get("image_path") != image_path:
-            _, processor = self._get_sam3_image_components()
-            with Image.open(image_path) as pil_image:
-                state = processor.set_image(pil_image.convert("RGB"))
-            cache_entry = {"image_path": image_path, "state": state}
-            sam3_image_states[image.pk] = cache_entry
-        return cache_entry["state"]
 
     @staticmethod
     def _get_image_dimensions(image_path: str):
@@ -821,8 +784,7 @@ class ModelManagerViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["post"])
     def load_model(self, request):
         try:
-            ImageViewSet._get_sam3_model()
-            ImageViewSet._get_sam3_image_components()
+            ImageViewSet._get_sam3_video_model()
             return Response({"message": "SAM3 models loaded"})
         except Exception as exc:
             return Response(
