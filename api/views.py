@@ -1,5 +1,6 @@
 import colorsys
 import io
+import logging
 import os
 import tempfile
 from contextlib import nullcontext
@@ -41,6 +42,8 @@ SAM3_LOAD_FROM_HF = SAM3_CHECKPOINT_PATH is None
 sam3_video_model = None
 sam3_video_states = {}
 sam3_text_obj_map = {}
+sam3_obj_category_map = {}
+log = logging.getLogger(__name__)
 
 
 class ProjectViewSet(viewsets.ModelViewSet):
@@ -351,6 +354,8 @@ class ImageViewSet(viewsets.ModelViewSet):
             scores = scores.detach().cpu().tolist()
         if torch.is_tensor(obj_ids):
             obj_ids = obj_ids.detach().cpu().tolist()
+        if isinstance(obj_ids, np.ndarray):
+            obj_ids = obj_ids.tolist()
 
         mask_list = list(masks)
         if not mask_list:
@@ -377,6 +382,8 @@ class ImageViewSet(viewsets.ModelViewSet):
             MaskCategory.objects.filter(project=project).values_list("name", flat=True)
         )
         created_categories = []
+        proj_cat_to_obj = sam3_text_obj_map.setdefault(project.id, {})
+        proj_obj_to_cat = sam3_obj_category_map.setdefault(project.id, {})
         for local_idx, mask_idx in enumerate(ordered_indices[: max_masks or 1]):
             category_name = self._next_category_name(
                 base_name=prompt_base, existing_names=existing_names, start_at=local_idx
@@ -421,12 +428,18 @@ class ImageViewSet(viewsets.ModelViewSet):
                 obj_id_value = (
                     obj_ids[mask_idx] if obj_ids and mask_idx < len(obj_ids) else None
                 )
-                if obj_id_value is not None:
-                    sam3_text_obj_map.setdefault(project.id, {})[category.id] = int(
-                        obj_id_value
-                    )
-            except Exception:
-                pass
+                if obj_id_value is None:
+                    obj_id_value = mask_idx  # fallback so we always have a mapping
+                obj_id_int = int(obj_id_value)
+                proj_cat_to_obj[category.id] = obj_id_int
+                proj_obj_to_cat[obj_id_int] = category.id
+            except Exception as exc:
+                log.warning(
+                    "[text-mask] failed mapping category_id=%s obj_id_value=%s (%s)",
+                    category.id,
+                    obj_id_value,
+                    exc,
+                )
 
         refreshed_image = ImageModel.objects.get(pk=image.pk)
         image_data = ImageModelSerializer(
@@ -470,6 +483,24 @@ class ImageViewSet(viewsets.ModelViewSet):
             categories_by_id = {
                 c.id: c for c in MaskCategory.objects.filter(project=project_obj)
             }
+            # Map SAM3 obj_ids that came from text prompts back to their categories so
+            # propagation doesn't collapse multiple tracked objects into the default.
+            text_obj_map = sam3_text_obj_map.get(project_obj.id, {})
+            for cat_id, obj_id in text_obj_map.items():
+                try:
+                    cat = categories_by_id.get(int(cat_id))
+                    if cat is not None:
+                        categories_by_id[int(obj_id)] = cat
+                except (TypeError, ValueError):
+                    continue
+            obj_category_map = sam3_obj_category_map.get(project_obj.id, {})
+            for obj_id, cat_id in obj_category_map.items():
+                try:
+                    cat = categories_by_id.get(int(cat_id))
+                    if cat is not None:
+                        categories_by_id[int(obj_id)] = cat
+                except (TypeError, ValueError):
+                    continue
             default_category = categories_by_id.get(
                 category_id
             ) or self._resolve_category(project_obj, category_id)
@@ -491,10 +522,17 @@ class ImageViewSet(viewsets.ModelViewSet):
                 reverse=False,
             ):
                 if outputs is None:
+                    log.warning("[propagate] frame=%s outputs=None", out_frame_idx)
                     continue
                 masks = outputs.get("out_binary_masks")
                 obj_ids = outputs.get("out_obj_ids")
                 if masks is None or obj_ids is None:
+                    log.warning(
+                        "[propagate] frame=%s missing masks/obj_ids (masks=%s obj_ids=%s)",
+                        out_frame_idx,
+                        type(masks).__name__ if masks is not None else None,
+                        type(obj_ids).__name__ if obj_ids is not None else None,
+                    )
                     continue
 
                 # Normalize possible tensor/ndarray outputs into Python lists
@@ -511,6 +549,11 @@ class ImageViewSet(viewsets.ModelViewSet):
                     image__endswith=f"{out_frame_idx:05d}.jpg"
                 ).first()
                 if not matching_image or len(masks) == 0:
+                    log.warning(
+                        "[propagate] frame=%s no matching image (%s) or masks empty",
+                        out_frame_idx,
+                        bool(matching_image),
+                    )
                     continue
 
                 # SAM3 returns one mask per tracked object; persist them all
@@ -545,9 +588,10 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def unload_model(self, request):
-        global sam3_video_model, sam3_video_states, sam3_text_obj_map
+        global sam3_video_model, sam3_video_states, sam3_text_obj_map, sam3_obj_category_map
         sam3_video_states = {}
         sam3_text_obj_map = {}
+        sam3_obj_category_map = {}
         # Keep models resident; just clear caches and GPU memory where possible.
         if sam3_video_model is not None:
             try:
