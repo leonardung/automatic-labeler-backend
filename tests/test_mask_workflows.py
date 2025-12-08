@@ -16,25 +16,6 @@ from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-# Provide a light cv2 stub for environments where OpenCV is unavailable.
-if "cv2" not in sys.modules:
-    import types
-
-    cv2_stub = types.SimpleNamespace(IMREAD_COLOR=1, INTER_AREA=3)
-
-    def _imdecode_stub(np_arr, flags):
-        return np.zeros((32, 32, 3), dtype=np.uint8)
-
-    def _resize_stub(img, size, interpolation=None):
-        return np.zeros((size[1], size[0], img.shape[2]), dtype=img.dtype)
-
-    def _imencode_stub(ext, img):
-        return True, np.ones((1,), dtype=np.uint8)
-
-    cv2_stub.imdecode = _imdecode_stub
-    cv2_stub.resize = _resize_stub
-    cv2_stub.imencode = _imencode_stub
-    sys.modules["cv2"] = cv2_stub
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -117,12 +98,24 @@ class MaskWorkflowTests(APITestCase):
             arr = np.array(img)
         return int(np.count_nonzero(arr))
 
+    def _assert_area_in_thresholds(self, label: str, area: int, thresholds: dict):
+        self.assertIn(label, thresholds, f"Missing area threshold for {label}")
+        lower, upper = thresholds[label]
+        self.assertGreaterEqual(
+            area, lower, f"Area for {label} below expected lower bound {lower}"
+        )
+        self.assertLessEqual(
+            area, upper, f"Area for {label} above expected upper bound {upper}"
+        )
+
     def test_image_project_point_and_text_masks(self):
         project = Project.objects.create(
             user=self.user, name="Image Project", type="segmentation"
         )
         image_id = self._upload_images(project, "image_project", ["logs.png"])[0]
-
+        areas_threshold = {
+            "single log": [7000, 7400],
+        }
         coord = {"x": 180.2, "y": 247.4, "include": True}
         mask_resp = self.client.post(
             f"/api/images/{image_id}/generate_mask/",
@@ -135,8 +128,7 @@ class MaskWorkflowTests(APITestCase):
         default_mask = image.masks.first()
         self.assertIsNotNone(default_mask)
         area = self._mask_area(default_mask.mask.path)
-        print(f"Image project 'single log' mask area: {area}")
-        self.assertGreater(area, 0)
+        self._assert_area_in_thresholds("single log", area, areas_threshold)
 
         text_resp = self.client.post(
             f"/api/images/{image_id}/generate_text_mask/",
@@ -155,10 +147,10 @@ class MaskWorkflowTests(APITestCase):
             user=self.user, name="Video Project", type="video_tracking_segmentation"
         )
         frame_names = ["00000.jpg", "00001.jpg", "00002.jpg", "00003.jpg", "00004.jpg"]
-        areas = {
+        areas_threshold = {
             "ball": [140, 200],
-            "player1": [42000, 47000],
-            "player2": [12000, 14000],
+            "player_1": [42000, 47000],
+            "player_2": [12000, 14000],
         }
         frame_ids = self._upload_images(project, "video_project", frame_names)
         first_frame_id = frame_ids[0]
@@ -172,8 +164,7 @@ class MaskWorkflowTests(APITestCase):
         self.assertEqual(mask_resp.status_code, status.HTTP_200_OK, mask_resp.content)
         ball_mask = SegmentationMask.objects.get(image_id=first_frame_id)
         base_area = self._mask_area(ball_mask.mask.path)
-        print(f"Video project 'ball' mask area (frame 0): {base_area}")
-        self.assertGreater(base_area, 0)
+        self._assert_area_in_thresholds("ball", base_area, areas_threshold)
 
         propagate_resp = self.client.post(
             "/api/images/propagate_mask/",
@@ -189,12 +180,7 @@ class MaskWorkflowTests(APITestCase):
         self.assertEqual(ball_masks.count(), len(frame_ids))
         for mask in ball_masks:
             area = self._mask_area(mask.mask.path)
-            print(
-                f"Video project 'ball' mask area ({mask.image.original_filename}): {area}"
-            )
-            self.assertAlmostEqual(area, base_area, delta=50)
-            self.assertGreaterEqual()
-            self.assertLessEqual()
+            self._assert_area_in_thresholds("ball", area, areas_threshold)
 
         text_resp = self.client.post(
             f"/api/images/{first_frame_id}/generate_text_mask/",
@@ -205,7 +191,7 @@ class MaskWorkflowTests(APITestCase):
         self.assertEqual(len(text_resp.data.get("created_categories", [])), 2)
         player_categories = MaskCategory.objects.filter(
             project=project, name__startswith="player_"
-        )
+        ).order_by("id")
         self.assertEqual(player_categories.count(), 2)
 
         propagate_players = self.client.post(
@@ -216,12 +202,12 @@ class MaskWorkflowTests(APITestCase):
         self.assertEqual(
             propagate_players.status_code, status.HTTP_200_OK, propagate_players.content
         )
-        for category in player_categories:
+        for idx, category in enumerate(player_categories, start=1):
+            threshold_label = f"player_{idx}"
             player_masks = SegmentationMask.objects.filter(
                 category=category, image__project=project
             ).order_by("image__original_filename")
             self.assertEqual(player_masks.count(), len(frame_ids))
-            first_area = self._mask_area(player_masks.first().mask.path)
             for mask in player_masks:
                 area = self._mask_area(mask.mask.path)
-                self.assertAlmostEqual(area, first_area, delta=3000)
+                self._assert_area_in_thresholds(threshold_label, area, areas_threshold)
