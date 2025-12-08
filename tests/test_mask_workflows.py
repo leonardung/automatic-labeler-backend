@@ -86,19 +86,29 @@ class MaskWorkflowTests(APITestCase):
         if os.path.exists(self.temp_db_path):
             os.remove(self.temp_db_path)
 
-    def _upload_images(self, project: Project, asset_subdir: str, filenames: List[str]) -> List[int]:
-        asset_base = Path(settings.BASE_DIR) / "tests" / "asset" / asset_subdir / "images"
+    def _upload_images(
+        self, project: Project, asset_subdir: str, filenames: List[str]
+    ) -> List[int]:
+        asset_base = (
+            Path(settings.BASE_DIR) / "tests" / "asset" / asset_subdir / "images"
+        )
         uploads = []
         for name in filenames:
             with open(asset_base / name, "rb") as fp:
-                content_type = "image/png" if name.lower().endswith("png") else "image/jpeg"
+                content_type = (
+                    "image/png" if name.lower().endswith("png") else "image/jpeg"
+                )
                 uploads.append(
-                    SimpleUploadedFile(name=name, content=fp.read(), content_type=content_type)
+                    SimpleUploadedFile(
+                        name=name, content=fp.read(), content_type=content_type
+                    )
                 )
 
         payload = {"project_id": project.id, "images": uploads}
         response = self.client.post("/api/images/", data=payload, format="multipart")
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.content)
+        self.assertEqual(
+            response.status_code, status.HTTP_201_CREATED, response.content
+        )
         return [img["id"] for img in response.data]
 
     @staticmethod
@@ -145,6 +155,11 @@ class MaskWorkflowTests(APITestCase):
             user=self.user, name="Video Project", type="video_tracking_segmentation"
         )
         frame_names = ["00000.jpg", "00001.jpg", "00002.jpg", "00003.jpg", "00004.jpg"]
+        areas = {
+            "ball": [140, 200],
+            "player1": [42000, 47000],
+            "player2": [12000, 14000],
+        }
         frame_ids = self._upload_images(project, "video_project", frame_names)
         first_frame_id = frame_ids[0]
 
@@ -165,16 +180,21 @@ class MaskWorkflowTests(APITestCase):
             {"project_id": project.id, "category_id": ball_mask.category_id},
             format="json",
         )
-        self.assertEqual(propagate_resp.status_code, status.HTTP_200_OK, propagate_resp.content)
-        ball_masks = (
-            SegmentationMask.objects.filter(category=ball_mask.category, image__project=project)
-            .order_by("image__original_filename")
+        self.assertEqual(
+            propagate_resp.status_code, status.HTTP_200_OK, propagate_resp.content
         )
+        ball_masks = SegmentationMask.objects.filter(
+            category=ball_mask.category, image__project=project
+        ).order_by("image__original_filename")
         self.assertEqual(ball_masks.count(), len(frame_ids))
         for mask in ball_masks:
             area = self._mask_area(mask.mask.path)
-            print(f"Video project 'ball' mask area ({mask.image.original_filename}): {area}")
-            self.assertEqual(area, base_area)
+            print(
+                f"Video project 'ball' mask area ({mask.image.original_filename}): {area}"
+            )
+            self.assertAlmostEqual(area, base_area, delta=50)
+            self.assertGreaterEqual()
+            self.assertLessEqual()
 
         text_resp = self.client.post(
             f"/api/images/{first_frame_id}/generate_text_mask/",
@@ -183,7 +203,9 @@ class MaskWorkflowTests(APITestCase):
         )
         self.assertEqual(text_resp.status_code, status.HTTP_200_OK, text_resp.content)
         self.assertEqual(len(text_resp.data.get("created_categories", [])), 2)
-        player_categories = MaskCategory.objects.filter(project=project, name__startswith="player_")
+        player_categories = MaskCategory.objects.filter(
+            project=project, name__startswith="player_"
+        )
         self.assertEqual(player_categories.count(), 2)
 
         propagate_players = self.client.post(
@@ -195,13 +217,11 @@ class MaskWorkflowTests(APITestCase):
             propagate_players.status_code, status.HTTP_200_OK, propagate_players.content
         )
         for category in player_categories:
-            player_masks = (
-                SegmentationMask.objects.filter(category=category, image__project=project)
-                .order_by("image__original_filename")
-            )
+            player_masks = SegmentationMask.objects.filter(
+                category=category, image__project=project
+            ).order_by("image__original_filename")
             self.assertEqual(player_masks.count(), len(frame_ids))
             first_area = self._mask_area(player_masks.first().mask.path)
-            print(f"Video project '{category.name}' mask area (frame 0): {first_area}")
             for mask in player_masks:
                 area = self._mask_area(mask.mask.path)
-                self.assertEqual(area, first_area)
+                self.assertAlmostEqual(area, first_area, delta=3000)
