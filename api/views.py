@@ -30,7 +30,12 @@ from api.serializers import (
     MaskCategorySerializer,
     ProjectSerializer,
 )
-from sam3.model_builder import build_sam3_video_model
+
+try:
+    from sam3.model_builder import build_sam3_video_model
+except ImportError:  # pragma: no cover - safeguards environments without SAM3 installed
+    def build_sam3_video_model(*args, **kwargs):
+        raise ImportError("sam3 is not installed; build_sam3_video_model is unavailable.")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
