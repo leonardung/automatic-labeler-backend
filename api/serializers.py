@@ -4,6 +4,7 @@ from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
 from api.models.mask import MaskCategory, SegmentationMask
 from api.models.project import Project
+from api.models.ocr import OcrAnnotation
 
 
 class CoordinateSerializer(serializers.ModelSerializer):
@@ -34,9 +35,16 @@ class SegmentationMaskSerializer(serializers.ModelSerializer):
         fields = ["id", "mask", "points", "category", "category_id"]
 
 
+class OcrAnnotationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OcrAnnotation
+        fields = ["id", "shape_type", "points", "text", "category"]
+
+
 class ImageModelSerializer(serializers.ModelSerializer):
     coordinates = CoordinateSerializer(many=True, read_only=True)
     masks = SegmentationMaskSerializer(many=True, read_only=True)
+    ocr_annotations = OcrAnnotationSerializer(many=True, read_only=True)
 
     class Meta:
         model = ImageModel
@@ -49,6 +57,7 @@ class ImageModelSerializer(serializers.ModelSerializer):
             "is_label",
             "original_filename",
             "masks",
+            "ocr_annotations",
         ]
 
 
