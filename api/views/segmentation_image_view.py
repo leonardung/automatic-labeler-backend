@@ -3,41 +3,31 @@ import io
 import logging
 import math
 import os
-import tempfile
-import uuid
 from contextlib import nullcontext
 from typing import Optional
 
-import cv2
 import numpy as np
 import torch
 from PIL import Image
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.shortcuts import get_object_or_404
-from rest_framework import status, viewsets
+from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework_simplejwt.authentication import JWTAuthentication
 
-from api.models.coordinate import Coordinate
 from api.models.image import ImageModel
 from api.models.mask import MaskCategory, SegmentationMask
 from api.models.project import Project
-from api.models.ocr import OcrAnnotation
-from api.serializers import (
-    ImageModelSerializer,
-    MaskCategorySerializer,
-    ProjectSerializer,
-)
+from api.serializers import ImageModelSerializer, MaskCategorySerializer
+from .base_image_view import BaseImageViewSet
 
 try:
     from sam3.model_builder import build_sam3_video_model
 except ImportError:  # pragma: no cover - safeguards environments without SAM3 installed
     def build_sam3_video_model(*args, **kwargs):
         raise ImportError("sam3 is not installed; build_sam3_video_model is unavailable.")
+
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -55,222 +45,42 @@ propagation_progress = {}
 log = logging.getLogger(__name__)
 
 
-class ProjectViewSet(viewsets.ModelViewSet):
-    queryset = Project.objects.all()
-    serializer_class = ProjectSerializer
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
+class SegmentationImageViewSet(BaseImageViewSet):
+    """
+    Segmentation and video-tracking endpoints backed by SAM3.
+    """
 
-    def get_queryset(self):
-        return Project.objects.filter(user=self.request.user)
-
-    def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
-
-    @action(detail=True, methods=["delete"])
-    def delete_masks(self, request, pk=None):
-        """
-        Deletes the mask files for all images associated with this project.
-        """
-        project = self.get_object()
-        masks = SegmentationMask.objects.filter(image__project=project)
-        count = masks.count()
-        for m in masks:
-            if m.mask:
-                m.mask.delete(save=False)
-        masks.delete()
-        return Response(
-            {"detail": f"Deleted masks for {count} images in the project."},
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["delete"])
-    def delete_coordinates(self, request, pk=None):
-        """
-        Deletes all coordinates associated with images in this project.
-        """
-        project = self.get_object()
-        project_images = ImageModel.objects.filter(project=project)
-        total_deleted = 0
-        for image in project_images:
-            deleted, _ = image.coordinates.all().delete()
-            total_deleted += deleted
-        return Response(
-            {"detail": f"Deleted {total_deleted} coordinate entries from the project."},
-            status=status.HTTP_200_OK,
-        )
-
-
-class MaskCategoryViewSet(viewsets.ModelViewSet):
-    queryset = MaskCategory.objects.all()
-    serializer_class = MaskCategorySerializer
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get_queryset(self):
-        return MaskCategory.objects.filter(project__user=self.request.user)
-
-    def perform_create(self, serializer):
-        project_id = self.request.data.get("project_id")
-        project = get_object_or_404(Project, id=project_id, user=self.request.user)
-        serializer.save(project=project)
-
-
-class ImageViewSet(viewsets.ModelViewSet):
-    queryset = ImageModel.objects.all()
-    serializer_class = ImageModelSerializer
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
+    allowed_project_types = ("segmentation", "video_tracking_segmentation")
 
     @staticmethod
     def _resolve_category(project: Project, category_id):
         if category_id:
             return get_object_or_404(MaskCategory, id=category_id, project=project)
-        # fallback/default category
         category, _ = MaskCategory.objects.get_or_create(
             project=project, name="Default", defaults={"color": "#00c800"}
         )
         return category
 
     def _ensure_frame_cache_initialized(self, inference_state):
-        """
-        SAM3 tracker expects a cached entry per frame before propagation/refinement.
-        If the cache is empty (e.g., right after reset_state), pre-seed it with
-        empty dicts for every frame to avoid assertion errors during propagation.
-        """
         cached = inference_state.get("cached_frame_outputs")
         if cached is None:
             return
         for idx in range(inference_state.get("num_frames", 0)):
             cached.setdefault(idx, {})
 
-    def get_queryset(self):
-        return ImageModel.objects.filter(project__user=self.request.user)
-
     def _get_autocast_context(self):
         if device == "cuda":
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-    def create(self, request, *args, **kwargs):
-        project_id = request.data.get("project_id")
-        is_label = request.data.get("is_label", False)
-
-        try:
-            project = Project.objects.get(id=project_id, user=request.user)
-        except Project.DoesNotExist:
-            return Response(
-                {
-                    "error": "Project not found or you do not have permission to access it."
-                },
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        images = request.FILES.getlist("images")
-        image_records = []
-
-        for image in images:
-            image_record = ImageModel.objects.create(
-                image=image,
-                is_label=is_label,
-                project=project,
-                original_filename=image.name,
-            )
-            image_records.append(image_record)
-
-        serializer = self.get_serializer(
-            image_records, many=True, context={"request": request}
-        )
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    @action(detail=True, methods=["post"])
-    def detect_regions(self, request, pk=None):
-        """
-        Mock OCR region detector that returns a few sample boxes/polygons.
-        """
-        image: ImageModel = self.get_object()
-        width, height = self._get_image_dimensions(image.image.path)
-        shapes = [
-            self._mock_rect_shape(width, height, 0.08, 0.1, 0.48, 0.24),
-            self._mock_rect_shape(width, height, 0.52, 0.15, 0.9, 0.3),
-            self._mock_polygon_shape(
-                [
-                    (0.12 * width, 0.42 * height),
-                    (0.46 * width, 0.4 * height),
-                    (0.52 * width, 0.47 * height),
-                    (0.18 * width, 0.5 * height),
-                ],
-                text="",
-            ),
-        ]
-        stored = self._replace_annotations(image, shapes)
-        return Response({"shapes": stored}, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"])
-    def recognize_text(self, request, pk=None):
-        """
-        Mock OCR recognizer that fills in placeholder text per shape.
-        """
-        shapes = request.data.get("shapes") or []
-        if not shapes:
-            return Response({"shapes": []}, status=status.HTTP_200_OK)
-        recognized_payload = []
-        for idx, shape in enumerate(shapes):
-            text = shape.get("text") or f"Text #{idx + 1}"
-            recognized_payload.append({**shape, "text": text})
-
-        image: ImageModel = self.get_object()
-        saved = self._upsert_annotations(image, recognized_payload)
-        return Response({"shapes": saved}, status=status.HTTP_200_OK)
-
-    @action(detail=True, methods=["post"])
-    def classify_kie(self, request, pk=None):
-        """
-        Mock KIE classifier that assigns categories in a round-robin fashion.
-        """
-        shapes = request.data.get("shapes") or []
-        incoming_categories = request.data.get("categories") or []
-        fallback_categories = incoming_categories or ["header", "field", "value", "table"]
-
-        classified = []
-        for idx, shape in enumerate(shapes):
-            category = shape.get("category") or fallback_categories[idx % len(fallback_categories)]
-            classified.append({**shape, "category": category})
-
-        image: ImageModel = self.get_object()
-        saved = self._upsert_annotations(image, classified)
-        return Response(
-            {"shapes": saved, "categories": fallback_categories},
-            status=status.HTTP_200_OK,
-        )
-
-    @action(detail=True, methods=["post"])
-    def ocr_annotations(self, request, pk=None):
-        """
-        Create or update OCR annotations in bulk.
-        """
-        image: ImageModel = self.get_object()
-        shapes = request.data.get("shapes") or []
-        saved = self._upsert_annotations(image, shapes)
-        return Response({"shapes": saved}, status=status.HTTP_200_OK)
-
-    @ocr_annotations.mapping.delete
-    def delete_ocr_annotations(self, request, pk=None):
-        """
-        Delete one or more OCR annotations by id. If no ids supplied, delete all.
-        """
-        image: ImageModel = self.get_object()
-        ids = request.data.get("ids") or []
-        qs = OcrAnnotation.objects.filter(image=image)
-        if ids:
-            qs = qs.filter(id__in=ids)
-        deleted, _ = qs.delete()
-        return Response({"deleted": deleted}, status=status.HTTP_200_OK)
-
     @action(detail=True, methods=["post"])
     def generate_mask(self, request, pk=None):
         image: ImageModel = self.get_object()
+        if image.project.type not in self.allowed_project_types:
+            return Response(
+                {"error": "This endpoint only supports segmentation projects."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         project = image.project
         data = request.data
         coordinates = data.get("coordinates") or []
@@ -304,7 +114,6 @@ class ImageViewSet(viewsets.ModelViewSet):
         frame_idx = self._frame_index_from_name(image.image.name)
         obj_id = data.get("obj_id")
         if obj_id is None:
-            # Prefer obj_id from a prior text prompt for the same category
             obj_id = sam3_text_obj_map.get(project.id, {}).get(category.id, category.id)
         try:
             obj_id = int(obj_id)
@@ -331,7 +140,6 @@ class ImageViewSet(viewsets.ModelViewSet):
         masks = outputs.get("out_binary_masks")
         obj_ids = outputs.get("out_obj_ids")
 
-        # Normalize to Python lists
         if torch.is_tensor(masks):
             masks = masks.detach().cpu().numpy()
         if isinstance(masks, np.ndarray):
@@ -349,7 +157,6 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        # Select the mask corresponding to this obj_id (fallback to first)
         selected_idx = 0
         try:
             selected_idx = next(
@@ -386,6 +193,11 @@ class ImageViewSet(viewsets.ModelViewSet):
     def generate_text_mask(self, request, pk=None):
         image: ImageModel = self.get_object()
         project = image.project
+        if project.type not in self.allowed_project_types:
+            return Response(
+                {"error": "This endpoint only supports segmentation projects."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         prompt = (request.data.get("prompt") or "").strip()
         max_masks = request.data.get("max_masks") or 1
         threshold = request.data.get("threshold", 0.5)
@@ -420,7 +232,6 @@ class ImageViewSet(viewsets.ModelViewSet):
         frame_idx = self._frame_index_from_name(image.image.name)
         inference_state["cached_frame_outputs"].setdefault(frame_idx, {})
 
-        # Apply user-provided threshold; the tracker uses this value during forward pass
         inference_state["tracker_confidence_threshold"] = threshold
         with self._get_autocast_context():
             _, outputs = model.add_prompt(
@@ -459,7 +270,6 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Remove any prior categories created from this prompt base before adding new ones
         MaskCategory.objects.filter(
             project=project, name__startswith=f"{prompt_base}_"
         ).delete()
@@ -495,7 +305,6 @@ class ImageViewSet(viewsets.ModelViewSet):
             if isinstance(mask_arr, np.ndarray):
                 mask_arr = np.squeeze(mask_arr)
                 if mask_arr.ndim > 2:
-                    # Fallback: take the first channel if squeezing still leaves depth
                     mask_arr = mask_arr[..., 0]
             binary_mask = (mask_arr > 0).astype(np.uint8) * 255
             mask_image = Image.fromarray(binary_mask, mode="L")
@@ -516,13 +325,12 @@ class ImageViewSet(viewsets.ModelViewSet):
             )
             segmentation_mask.save(update_fields=["points"])
 
-            # Track obj_id mapping so future point prompts refine this object
             try:
                 obj_id_value = (
                     obj_ids[mask_idx] if obj_ids and mask_idx < len(obj_ids) else None
                 )
                 if obj_id_value is None:
-                    obj_id_value = mask_idx  # fallback so we always have a mapping
+                    obj_id_value = mask_idx
                 obj_id_int = int(obj_id_value)
                 proj_cat_to_obj[category.id] = obj_id_int
                 proj_obj_to_cat[obj_id_int] = category.id
@@ -576,8 +384,6 @@ class ImageViewSet(viewsets.ModelViewSet):
             categories_by_id = {
                 c.id: c for c in MaskCategory.objects.filter(project=project_obj)
             }
-            # Map SAM3 obj_ids that came from text prompts back to their categories so
-            # propagation doesn't collapse multiple tracked objects into the default.
             text_obj_map = sam3_text_obj_map.get(project_obj.id, {})
             for cat_id, obj_id in text_obj_map.items():
                 try:
@@ -613,8 +419,6 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         self._set_propagation_progress(project_obj.id, 0, total_frames, "running")
-        # SAM3 holds back the first `hotstart_delay` frames before yielding anything, so
-        # offset progress to match the model's tqdm bar rather than the yielded frames.
         progress_offset = int(getattr(model, "hotstart_delay", 0))
         processed_frames = 0
         with self._get_autocast_context():
@@ -646,7 +450,6 @@ class ImageViewSet(viewsets.ModelViewSet):
                         )
                         continue
 
-                    # Normalize possible tensor/ndarray outputs into Python lists
                     if torch.is_tensor(masks):
                         masks = masks.detach().cpu().numpy()
                     if isinstance(masks, np.ndarray):
@@ -667,7 +470,6 @@ class ImageViewSet(viewsets.ModelViewSet):
                         )
                         continue
 
-                    # SAM3 returns one mask per tracked object; persist them all
                     for idx, obj_id in enumerate(obj_ids):
                         if idx >= len(masks):
                             continue
@@ -718,7 +520,6 @@ class ImageViewSet(viewsets.ModelViewSet):
         sam3_video_states = {}
         sam3_text_obj_map = {}
         sam3_obj_category_map = {}
-        # Keep models resident; just clear caches and GPU memory where possible.
         if sam3_video_model is not None:
             try:
                 sam3_video_model.reset_state()
@@ -751,10 +552,6 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def propagation_progress(self, request):
-        """
-        Returns the current propagation progress for a project so the frontend
-        can poll. Always starts at 0 for a new run.
-        """
         project_id = request.query_params.get("project_id")
         if not project_id:
             return Response(
@@ -770,11 +567,6 @@ class ImageViewSet(viewsets.ModelViewSet):
 
     @staticmethod
     def _color_for_index(index: int) -> str:
-        """
-        Generate a visually distinct color. Uses a golden-ratio hue step so
-        successive calls produce separated hues and includes a gentle alpha
-        for nicer overlays on the frontend.
-        """
         hue = (index * 0.61803398875) % 1.0
         r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(hue, 0.65, 0.95)]
         return f"rgba({r},{g},{b},0.6)"
@@ -787,12 +579,8 @@ class ImageViewSet(viewsets.ModelViewSet):
     def _next_category_name(
         base_name: str, existing_names: set[str], start_at: int
     ) -> str:
-        """
-        Generate the next available <prompt>_<id> name while respecting the
-        unique constraint on categories.
-        """
         idx = start_at
-        sanitized = ImageViewSet._sanitize_prompt_base(base_name)
+        sanitized = SegmentationImageViewSet._sanitize_prompt_base(base_name)
         while True:
             candidate = f"{sanitized}_{idx}"
             if candidate not in existing_names:
@@ -814,13 +602,7 @@ class ImageViewSet(viewsets.ModelViewSet):
     def _get_video_inference_state(
         self, project: Project, image: Optional[ImageModel] = None
     ):
-        """
-        For simple segmentation projects, only load the single active image into SAM3
-        so switching images resets the model and avoids loading all project images.
-        Video tracking projects keep a project-level state for propagation across frames.
-        """
         cache_entry = sam3_video_states.get(project.pk)
-        # Normalize legacy cache shape (plain inference_state) into a dict
         if cache_entry is not None and not isinstance(cache_entry, dict):
             cache_entry = {"state": cache_entry}
 
@@ -864,75 +646,6 @@ class ImageViewSet(viewsets.ModelViewSet):
         return inference_state
 
     @staticmethod
-    def _mock_rect_shape(width: int, height: int, x1: float, y1: float, x2: float, y2: float, text=""):
-        return {
-            "id": uuid.uuid4().hex,
-            "type": "rect",
-            "points": [
-                {"x": int(x1 * width), "y": int(y1 * height)},
-                {"x": int(x2 * width), "y": int(y1 * height)},
-                {"x": int(x2 * width), "y": int(y2 * height)},
-                {"x": int(x1 * width), "y": int(y2 * height)},
-            ],
-            "text": text,
-            "category": None,
-        }
-
-    @staticmethod
-    def _mock_polygon_shape(points, text=""):
-        return {
-            "id": uuid.uuid4().hex,
-            "type": "polygon",
-            "points": [{"x": int(x), "y": int(y)} for x, y in points],
-            "text": text,
-            "category": None,
-        }
-
-    @staticmethod
-    def _shape_from_annotation(annotation: OcrAnnotation):
-        return {
-            "id": str(annotation.id),
-            "type": annotation.shape_type,
-            "points": annotation.points,
-            "text": annotation.text or "",
-            "category": annotation.category,
-        }
-
-    def _replace_annotations(self, image: ImageModel, shapes_payload):
-        OcrAnnotation.objects.filter(image=image).delete()
-        created = []
-        for shape in shapes_payload:
-            obj = OcrAnnotation.objects.create(
-                image=image,
-                shape_type=shape.get("type", "rect"),
-                points=shape.get("points", []),
-                text=shape.get("text", "") or "",
-                category=shape.get("category"),
-            )
-            created.append(obj)
-        return [self._shape_from_annotation(obj) for obj in created]
-
-    def _upsert_annotations(self, image: ImageModel, shapes_payload):
-        serialized = []
-        for shape in shapes_payload:
-            shape_id = shape.get("id")
-            instance = None
-            if shape_id:
-                try:
-                    instance = OcrAnnotation.objects.get(id=shape_id, image=image)
-                except (OcrAnnotation.DoesNotExist, ValueError):
-                    instance = None
-            if instance is None:
-                instance = OcrAnnotation(image=image)
-            instance.shape_type = shape.get("type", instance.shape_type or "rect")
-            instance.points = shape.get("points", instance.points or [])
-            instance.text = shape.get("text", instance.text or "") or ""
-            instance.category = shape.get("category", instance.category)
-            instance.save()
-            serialized.append(self._shape_from_annotation(instance))
-        return serialized
-
-    @staticmethod
     def _get_image_dimensions(image_path: str):
         with Image.open(image_path) as img:
             return img.size
@@ -940,7 +653,7 @@ class ImageViewSet(viewsets.ModelViewSet):
     @staticmethod
     def _frame_index_from_name(path: str) -> int:
         try:
-            return int(ImageViewSet._frame_stem(path))
+            return int(SegmentationImageViewSet._frame_stem(path))
         except ValueError:
             return 0
 
@@ -966,109 +679,3 @@ class ImageViewSet(viewsets.ModelViewSet):
             "status": status_str,
             "detail": detail,
         }
-
-
-class VideoViewSet(viewsets.ViewSet):
-    """
-    Handles video uploads. Extracts frames with configurable stride and maximum frames,
-    saves them to ImageVideoModel, and returns the created frame records.
-    """
-
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def create(self, request, *args, **kwargs):
-        project_id = request.data.get("project_id")
-        is_label = request.data.get("is_label", False)
-        stride = int(request.data.get("stride", 1))
-        max_frames = int(request.data.get("max_frames", 500))
-
-        project = get_object_or_404(Project, id=project_id, user=request.user)
-
-        # Expect a single "video" file
-        video_file = request.FILES.get("video")
-        if not video_file:
-            return Response(
-                {"error": "No video file found in the request."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if not video_file.content_type.startswith("video/"):
-            return Response(
-                {"error": "Uploaded file is not a video."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # 1) Save the uploaded video to a temporary file
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp:
-            for chunk in video_file.chunks():
-                temp.write(chunk)
-            temp_name = temp.name
-
-        # 2) Extract frames using OpenCV
-        cap = cv2.VideoCapture(temp_name)
-        frame_records = []
-        frame_index = 0
-        saved_frames = 0
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break  # no more frames
-
-            # Skip frames based on stride
-            if frame_index % stride != 0:
-                frame_index += 1
-                continue
-
-            # Stop if max_frames limit is reached
-            if saved_frames >= max_frames:
-                break
-
-            # Convert the OpenCV frame to bytes
-            success, buffer = cv2.imencode(".jpg", frame)
-            if not success:
-                frame_index += 1
-                continue
-
-            frame_name = f"{saved_frames:05d}.jpg"
-            frame_content = ContentFile(buffer.tobytes(), name=frame_name)
-
-            frame_model = ImageModel.objects.create(
-                image=frame_content,
-                is_label=is_label,
-                project=project,
-                original_filename=frame_name,
-            )
-            frame_records.append(frame_model)
-            saved_frames += 1
-            frame_index += 1
-
-        cap.release()
-
-        serializer = ImageModelSerializer(
-            frame_records, many=True, context={"request": request}
-        )
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-
-
-class ModelManagerViewSet(viewsets.ViewSet):
-    parser_classes = (MultiPartParser, FormParser, JSONParser)
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    @action(detail=False, methods=["post"])
-    def load_model(self, request):
-        try:
-            ImageViewSet._get_sam3_video_model()
-            return Response({"message": "SAM3 models loaded"})
-        except Exception as exc:
-            return Response(
-                {"error": f"Failed to load SAM3: {exc}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-
-    @action(detail=False, methods=["post"])
-    def unload_model(self, request):
-        return ImageViewSet.unload_model(self, request)
