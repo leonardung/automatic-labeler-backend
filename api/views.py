@@ -1,6 +1,7 @@
 import colorsys
 import io
 import logging
+import math
 import os
 import tempfile
 from contextlib import nullcontext
@@ -521,6 +522,9 @@ class ImageViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         self._set_propagation_progress(project_obj.id, 0, total_frames, "running")
+        # SAM3 holds back the first `hotstart_delay` frames before yielding anything, so
+        # offset progress to match the model's tqdm bar rather than the yielded frames.
+        progress_offset = int(getattr(model, "hotstart_delay", 0))
         processed_frames = 0
         with self._get_autocast_context():
             try:
@@ -531,8 +535,11 @@ class ImageViewSet(viewsets.ModelViewSet):
                     reverse=False,
                 ):
                     processed_frames += 1
+                    effective_frames = min(
+                        processed_frames + progress_offset, total_frames
+                    )
                     self._set_propagation_progress(
-                        project_obj.id, processed_frames, total_frames, "running"
+                        project_obj.id, effective_frames, total_frames, "running"
                     )
                     if outputs is None:
                         log.warning("[propagate] frame=%s outputs=None", out_frame_idx)
@@ -594,11 +601,7 @@ class ImageViewSet(viewsets.ModelViewSet):
                         )
             except Exception as exc:
                 self._set_propagation_progress(
-                    project_obj.id,
-                    processed_frames,
-                    total_frames,
-                    "failed",
-                    detail=str(exc),
+                    project_obj.id, 0, 0, "failed", detail=str(exc)
                 )
                 log.exception("Propagation failed for project %s", project_obj.id)
                 return Response(
@@ -611,9 +614,7 @@ class ImageViewSet(viewsets.ModelViewSet):
                 except Exception:
                     pass
 
-        self._set_propagation_progress(
-            project_obj.id, total_frames, total_frames, "completed"
-        )
+        self._set_propagation_progress(project_obj.id, 0, 0, "idle")
 
         serializer = ImageModelSerializer(
             project_images, many=True, context={"request": request}
