@@ -102,11 +102,12 @@ class OcrImageViewSet(BaseImageViewSet):
                 if score is not None and score < score_threshold:
                     continue
                 points = [{"x": int(pt[0]), "y": int(pt[1])} for pt in poly]
+                rect_points = self._polygon_to_rect(points, tolerance_ratio=10)
                 shapes.append(
                     {
                         "id": uuid.uuid4().hex,
-                        "type": "polygon",
-                        "points": points,
+                        "type": "rect" if rect_points else "polygon",
+                        "points": rect_points or points,
                         "text": "",
                         "category": None,
                     }
@@ -284,3 +285,52 @@ class OcrImageViewSet(BaseImageViewSet):
     def _get_image_dimensions(image_path: str):
         with Image.open(image_path) as img:
             return img.size
+
+    @staticmethod
+    def _polygon_to_rect(points, tolerance_ratio: float = 0.1):
+        """
+        If points roughly form an axis-aligned rectangle, return rectangle corners.
+        """
+        if len(points) != 4:
+            return None
+        xs = [p["x"] for p in points]
+        ys = [p["y"] for p in points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        width = max_x - min_x
+        height = max_y - min_y
+        if width <= 0 or height <= 0:
+            return None
+
+        bbox_area = width * height
+        poly_area = OcrImageViewSet._polygon_area(points)
+        if poly_area <= 0:
+            return None
+
+        # Check area closeness to rectangle area
+        if poly_area / bbox_area < 0.5:
+            return None
+
+        tol = max(width, height) * tolerance_ratio
+        for x, y in zip(xs, ys):
+            if (abs(x - min_x) > tol and abs(x - max_x) > tol) or (
+                abs(y - min_y) > tol and abs(y - max_y) > tol
+            ):
+                return None
+
+        return [
+            {"x": min_x, "y": min_y},
+            {"x": max_x, "y": min_y},
+            {"x": max_x, "y": max_y},
+            {"x": min_x, "y": max_y},
+        ]
+
+    @staticmethod
+    def _polygon_area(points):
+        area = 0.0
+        n = len(points)
+        for i in range(n):
+            x1, y1 = points[i]["x"], points[i]["y"]
+            x2, y2 = points[(i + 1) % n]["x"], points[(i + 1) % n]["y"]
+            area += x1 * y2 - x2 * y1
+        return abs(area) / 2.0
