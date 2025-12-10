@@ -33,6 +33,8 @@ DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
 DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
 _DETECTOR_CACHE: dict[str, TextDetection] = {}
 _RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
+ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
+ACTIVE_REC_MODEL_NAME = DEFAULT_REC_MODEL_NAME
 
 
 class OcrImageViewSet(BaseImageViewSet):
@@ -63,7 +65,7 @@ class OcrImageViewSet(BaseImageViewSet):
         model_name = (
             request.data.get("model_name")
             or request.query_params.get("model_name")
-            or DEFAULT_DET_MODEL_NAME
+            or ACTIVE_DET_MODEL_NAME
         )
         score_threshold_raw = request.data.get(
             "score_threshold"
@@ -74,6 +76,13 @@ class OcrImageViewSet(BaseImageViewSet):
             )
         except (TypeError, ValueError):
             score_threshold = 0.3
+        tolerance_raw = request.data.get("tolerance_ratio") or request.query_params.get(
+            "tolerance_ratio"
+        )
+        try:
+            tolerance_ratio = float(tolerance_raw) if tolerance_raw is not None else 0.2
+        except (TypeError, ValueError):
+            tolerance_ratio = 0.2
 
         detector = _DETECTOR_CACHE.get(model_name)
         if detector is None:
@@ -106,7 +115,9 @@ class OcrImageViewSet(BaseImageViewSet):
                 if score is not None and score < score_threshold:
                     continue
                 points = [{"x": int(pt[0]), "y": int(pt[1])} for pt in poly]
-                rect_points = self._polygon_to_rect(points, tolerance_ratio=0.2)
+                rect_points = self._polygon_to_rect(
+                    points, tolerance_ratio=tolerance_ratio
+                )
                 shapes.append(
                     {
                         "id": uuid.uuid4().hex,
@@ -141,7 +152,7 @@ class OcrImageViewSet(BaseImageViewSet):
         model_name = (
             request.data.get("model_name")
             or request.query_params.get("model_name")
-            or DEFAULT_REC_MODEL_NAME
+            or ACTIVE_REC_MODEL_NAME
         )
         recognizer = _RECOGNIZER_CACHE.get(model_name)
         if recognizer is None:
@@ -284,33 +295,6 @@ class OcrImageViewSet(BaseImageViewSet):
         return None
 
     @staticmethod
-    def _mock_rect_shape(
-        width: int, height: int, x1: float, y1: float, x2: float, y2: float, text=""
-    ):
-        return {
-            "id": uuid.uuid4().hex,
-            "type": "rect",
-            "points": [
-                {"x": int(x1 * width), "y": int(y1 * height)},
-                {"x": int(x2 * width), "y": int(y1 * height)},
-                {"x": int(x2 * width), "y": int(y2 * height)},
-                {"x": int(x1 * width), "y": int(y2 * height)},
-            ],
-            "text": text,
-            "category": None,
-        }
-
-    @staticmethod
-    def _mock_polygon_shape(points, text=""):
-        return {
-            "id": uuid.uuid4().hex,
-            "type": "polygon",
-            "points": [{"x": int(x), "y": int(y)} for x, y in points],
-            "text": text,
-            "category": None,
-        }
-
-    @staticmethod
     def _shape_from_annotation(annotation: OcrAnnotation):
         return {
             "id": str(annotation.id),
@@ -375,13 +359,8 @@ class OcrImageViewSet(BaseImageViewSet):
         if width <= 0 or height <= 0:
             return None
 
-        bbox_area = width * height
         poly_area = OcrImageViewSet._polygon_area(points)
         if poly_area <= 0:
-            return None
-
-        # Check area closeness to rectangle area
-        if poly_area / bbox_area < 0.5:
             return None
 
         tol = max(width, height) * tolerance_ratio
@@ -422,3 +401,63 @@ class OcrImageViewSet(BaseImageViewSet):
         if min_x == max_x or min_y == max_y:
             return None
         return (min_x, min_y, max_x, max_y)
+
+    @action(detail=False, methods=["post"])
+    def configure_models(self, request):
+        """
+        Load and set active detect/recognize models. Unload previous active models if changed.
+        """
+        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME
+
+        if TextDetection is None or TextRecognition is None:
+            return Response(
+                {"error": "PaddleOCR modules unavailable. Is the submodule installed?"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        detect_model = request.data.get("detect_model") or ACTIVE_DET_MODEL_NAME
+        recognize_model = request.data.get("recognize_model") or ACTIVE_REC_MODEL_NAME
+
+        changed = {"detect": False, "recognize": False}
+
+        if detect_model != ACTIVE_DET_MODEL_NAME or detect_model not in _DETECTOR_CACHE:
+            _DETECTOR_CACHE.pop(ACTIVE_DET_MODEL_NAME, None)
+            try:
+                _DETECTOR_CACHE[detect_model] = TextDetection(model_name=detect_model)
+                ACTIVE_DET_MODEL_NAME = detect_model
+                changed["detect"] = True
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception("Failed to load detect model %s: %s", detect_model, exc)
+                return Response(
+                    {"error": f"Failed to load detect model '{detect_model}'."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+        if (
+            recognize_model != ACTIVE_REC_MODEL_NAME
+            or recognize_model not in _RECOGNIZER_CACHE
+        ):
+            _RECOGNIZER_CACHE.pop(ACTIVE_REC_MODEL_NAME, None)
+            try:
+                _RECOGNIZER_CACHE[recognize_model] = TextRecognition(
+                    model_name=recognize_model
+                )
+                ACTIVE_REC_MODEL_NAME = recognize_model
+                changed["recognize"] = True
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception(
+                    "Failed to load recognize model %s: %s", recognize_model, exc
+                )
+                return Response(
+                    {"error": f"Failed to load recognize model '{recognize_model}'."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+        return Response(
+            {
+                "detect_model": ACTIVE_DET_MODEL_NAME,
+                "recognize_model": ACTIVE_REC_MODEL_NAME,
+                "changed": changed,
+            },
+            status=status.HTTP_200_OK,
+        )
