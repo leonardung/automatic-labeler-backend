@@ -4,6 +4,7 @@ import sys
 import uuid
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 from rest_framework import status
 from rest_framework.decorators import action
@@ -22,13 +23,16 @@ PADDLE_SUBMODULE_PATH = (
 if str(PADDLE_SUBMODULE_PATH) not in sys.path:
     sys.path.append(str(PADDLE_SUBMODULE_PATH))
 try:
-    from paddleocr import TextDetection
+    from paddleocr import TextDetection, TextRecognition
 except Exception as exc:  # pragma: no cover - import guard for optional dependency
     TextDetection = None
-    log.exception("Failed to import paddleocr TextDetection: %s", exc)
+    TextRecognition = None
+    log.exception("Failed to import paddleocr: %s", exc)
 
 DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
+DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
 _DETECTOR_CACHE: dict[str, TextDetection] = {}
+_RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
 
 
 class OcrImageViewSet(BaseImageViewSet):
@@ -102,7 +106,7 @@ class OcrImageViewSet(BaseImageViewSet):
                 if score is not None and score < score_threshold:
                     continue
                 points = [{"x": int(pt[0]), "y": int(pt[1])} for pt in poly]
-                rect_points = self._polygon_to_rect(points, tolerance_ratio=10)
+                rect_points = self._polygon_to_rect(points, tolerance_ratio=0.2)
                 shapes.append(
                     {
                         "id": uuid.uuid4().hex,
@@ -119,19 +123,88 @@ class OcrImageViewSet(BaseImageViewSet):
     @action(detail=True, methods=["post"])
     def recognize_text(self, request, pk=None):
         """
-        Mock OCR recognizer that fills in placeholder text per shape.
+        Run PaddleOCR text recognition on provided shapes (cropped regions).
         """
         image: ImageModel = self.get_object()
         error = self._validate_project(image)
         if error:
             return error
+
+        if TextRecognition is None:
+            return Response(
+                {
+                    "error": "PaddleOCR TextRecognition unavailable. Is the submodule installed?"
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        model_name = (
+            request.data.get("model_name")
+            or request.query_params.get("model_name")
+            or DEFAULT_REC_MODEL_NAME
+        )
+        recognizer = _RECOGNIZER_CACHE.get(model_name)
+        if recognizer is None:
+            try:
+                recognizer = TextRecognition(model_name=model_name)
+                _RECOGNIZER_CACHE[model_name] = recognizer
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception("Failed to initialize PaddleOCR recognizer: %s", exc)
+                return Response(
+                    {"error": f"Failed to load recognition model '{model_name}'."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
         shapes = request.data.get("shapes") or []
         if not shapes:
             return Response({"shapes": []}, status=status.HTTP_200_OK)
-        recognized_payload = []
-        for idx, shape in enumerate(shapes):
-            text = shape.get("text") or f"Text #{idx + 1}"
-            recognized_payload.append({**shape, "text": text})
+
+        try:
+            with Image.open(image.image.path) as img:
+                base_image = img.convert("RGB")
+                recognized_payload = []
+                img_width, img_height = base_image.size
+                for shape in shapes:
+                    points = shape.get("points") or []
+                    bbox = self._bbox_from_points(points)
+                    if bbox is None:
+                        recognized_payload.append(
+                            {**shape, "text": shape.get("text") or ""}
+                        )
+                        continue
+                    min_x, min_y, max_x, max_y = bbox
+                    min_x = max(0, min_x)
+                    min_y = max(0, min_y)
+                    max_x = min(img_width, max_x)
+                    max_y = min(img_height, max_y)
+                    if min_x >= max_x or min_y >= max_y:
+                        recognized_payload.append(
+                            {**shape, "text": shape.get("text") or ""}
+                        )
+                        continue
+                    region = base_image.crop((min_x, min_y, max_x, max_y))
+                    crop_arr = np.array(region)
+                    text = shape.get("text") or ""
+                    try:
+                        rec_output = recognizer.predict(input=crop_arr, batch_size=1)
+                        if rec_output:
+                            rec_text = rec_output[0].get("rec_text", "")
+                            text = rec_text or text
+                    except Exception as exc:  # pragma: no cover - runtime dependency
+                        log.exception(
+                            "Text recognition failed for shape on image %s: %s",
+                            image.id,
+                            exc,
+                        )
+                    recognized_payload.append({**shape, "text": text})
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            log.exception(
+                "Failed to process image for recognition %s: %s", image.id, exc
+            )
+            return Response(
+                {"error": "Text recognition failed."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         saved = self._upsert_annotations(image, recognized_payload)
         return Response({"shapes": saved}, status=status.HTTP_200_OK)
@@ -334,3 +407,18 @@ class OcrImageViewSet(BaseImageViewSet):
             x2, y2 = points[(i + 1) % n]["x"], points[(i + 1) % n]["y"]
             area += x1 * y2 - x2 * y1
         return abs(area) / 2.0
+
+    @staticmethod
+    def _bbox_from_points(points):
+        if not points:
+            return None
+        try:
+            xs = [int(p["x"]) for p in points]
+            ys = [int(p["y"]) for p in points]
+        except (TypeError, KeyError, ValueError):
+            return None
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        if min_x == max_x or min_y == max_y:
+            return None
+        return (min_x, min_y, max_x, max_y)
