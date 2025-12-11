@@ -80,7 +80,7 @@ class OcrImageViewSet(BaseImageViewSet):
             "tolerance_ratio"
         )
         try:
-            tolerance_ratio = float(tolerance_raw) if tolerance_raw is not None else 0.2
+            tolerance_ratio = float(tolerance_raw) if tolerance_raw is not None else 0
         except (TypeError, ValueError):
             tolerance_ratio = 0.2
 
