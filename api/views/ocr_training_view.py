@@ -462,6 +462,8 @@ def _run_training(job: TrainingJob):
             job.append_log(f"Starting training job {job.id} for project {project.id}\n")
             dataset_info = _prepare_datasets(project, config_for_dataset)
             job.dataset_info = dataset_info
+            if "images_folder" not in global_cfg and dataset_info.get("images_dir"):
+                global_cfg["images_folder"] = dataset_info["images_dir"]
             job.append_log(
                 f"Prepared datasets at {dataset_info.get('dataset_dir', '')}\n"
             )
@@ -569,13 +571,17 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
 
     det_info = _write_detection_dataset(dataset_root, train_samples, val_samples)
     rec_info = _write_recognition_dataset(dataset_root, train_samples, val_samples)
-    kie_info = _write_kie_dataset(dataset_root, train_samples, val_samples)
+    images_root = Path(train_samples[0]["image_path"]).parent
+    kie_info = _write_kie_dataset(
+        dataset_root, train_samples, val_samples, images_root=images_root
+    )
 
     return {
         "label_file": str(det_info["train_label"]),
         "samples": len(train_samples) + len(val_samples),
         "annotations": sum(len(s["shapes"]) for s in train_samples + val_samples),
         "dataset_dir": str(dataset_root),
+        "images_dir": str(images_root),
         "det": det_info,
         "rec": rec_info,
         "kie": kie_info,
@@ -655,9 +661,11 @@ def _write_recognition_dataset(dataset_root: Path, train_samples, val_samples):
     }
 
 
-def _write_kie_dataset(dataset_root: Path, train_samples, val_samples):
-    kie_root = _ensure_dir(dataset_root / "kie" / "train_data" / "XFUND")
-    class_list_path = kie_root / "class_list_xfun.txt"
+def _write_kie_dataset(
+    dataset_root: Path, train_samples, val_samples, images_root: Path
+):
+    kie_root = _ensure_dir(dataset_root / "kie" / "train_data")
+    class_list_path = kie_root / "class_list.txt"
     categories = set()
     for sample in train_samples + val_samples:
         for shape in sample["shapes"]:
@@ -667,16 +675,11 @@ def _write_kie_dataset(dataset_root: Path, train_samples, val_samples):
         categories.add("others")
     class_list_path.write_text("\n".join(sorted(categories)), encoding="utf-8")
 
-    def _write(split_samples, name: str):
-        manifest_path = (
-            _ensure_dir(kie_root / name)
-            / f"{'train' if name=='zh_train' else 'val'}.json"
-        )
+    def _write(split_samples, filename: str):
+        manifest_path = kie_root / filename
         manifest = []
         for sample in split_samples:
-            rel_img = Path(
-                os.path.relpath(sample["image_path"], start=manifest_path.parent)
-            )
+            rel_img = Path(os.path.relpath(sample["image_path"], start=images_root))
             ocr_info = []
             for shape in sample["shapes"]:
                 bbox = shape.get("bbox") or _bbox_from_points(shape["points"])
@@ -703,13 +706,15 @@ def _write_kie_dataset(dataset_root: Path, train_samples, val_samples):
         )
         return manifest_path
 
-    train_json = _write(train_samples, "zh_train")
-    val_json = _write(val_samples, "zh_val")
+    train_json = _write(train_samples, "train.json")
+    val_json = _write(val_samples, "val.json")
     return {
         "data_dir": str(kie_root),
+        "images_dir": str(images_root),
         "train_label": str(train_json),
         "val_label": str(val_json),
         "class_path": str(class_list_path),
+        "num_classes": len(categories),
     }
 
 
@@ -771,15 +776,38 @@ def _train_model(
         )
     elif target == "kie":
         kie = dataset_info["kie"]
+        num_classes = max(1, int(kie.get("num_classes") or 0))
+        images_folder = global_cfg.get("images_folder") or kie.get("images_dir")
+        if not images_folder:
+            raise RuntimeError("Images folder is required for KIE training.")
+        images_folder = Path(images_folder).as_posix()
+        class_path = Path(kie["class_path"]).as_posix()
+        train_label_path = Path(kie["train_label"]).as_posix()
+        val_label_path = Path(kie["val_label"]).as_posix()
+        kie_model_cfg = {
+            "class_path": class_path,
+            "pretrained_model": (
+                PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh"
+            ).as_posix(),
+            "dataset_train": f'["{train_label_path}"]',
+            "dataset_val": f'["{val_label_path}"]',
+        }
         overrides_list.extend(
             [
-                f"Architecture.Backbone.checkpoints={PRETRAIN_ROOT / 'ser_LayoutXLM_xfun_zh'}",
                 f"Global.save_model_dir={models_dir}",
-                f"Train.dataset.data_dir={kie['data_dir'] + '/zh_train'}",
-                f"Train.dataset.label_file_list=['{kie['train_label']}']",
-                f"Eval.dataset.data_dir={kie['data_dir'] + '/zh_val'}",
-                f"Eval.dataset.label_file_list=['{kie['val_label']}']",
-                f"PostProcess.class_path={kie['class_path']}",
+                f"Global.class_path={kie_model_cfg['class_path']}",
+                f"PostProcess.class_path={kie_model_cfg['class_path']}",
+                f"Train.dataset.transforms.1.VQATokenLabelEncode.class_path={kie_model_cfg['class_path']}",
+                f"Eval.dataset.transforms.1.VQATokenLabelEncode.class_path={kie_model_cfg['class_path']}",
+                f"Architecture.Backbone.pretrained={kie_model_cfg['pretrained_model']}",
+                f"Architecture.Backbone.num_classes={int(2 * num_classes - 1)}",
+                f"Loss.num_classes={int(2 * num_classes - 1)}",
+                f"Train.dataset.data_dir={images_folder}",
+                f"Train.dataset.label_file_list={kie_model_cfg['dataset_train']}",
+                "Train.dataset.ratio_list=1",
+                f"Eval.dataset.data_dir={images_folder}",
+                f"Eval.dataset.label_file_list={kie_model_cfg['dataset_val']}",
+                "Eval.dataset.ratio_list=1",
             ]
         )
 
