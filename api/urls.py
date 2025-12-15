@@ -4,6 +4,9 @@ from api.views import (
     MaskCategoryViewSet,
     ModelManagerViewSet,
     OcrImageViewSet,
+    OcrTrainingDefaultsView,
+    OcrTrainingJobView,
+    OcrTrainingStartView,
     ProjectViewSet,
     SegmentationImageViewSet,
     VideoViewSet,
@@ -19,4 +22,7 @@ router.register(r"categories", MaskCategoryViewSet, basename="categories")
 
 urlpatterns = [
     path("", include(router.urls)),
+    path("ocr-training/defaults/", OcrTrainingDefaultsView.as_view(), name="ocr-training-defaults"),
+    path("ocr-training/start/", OcrTrainingStartView.as_view(), name="ocr-training-start"),
+    path("ocr-training/jobs/<str:job_id>/", OcrTrainingJobView.as_view(), name="ocr-training-job"),
 ]

@@ -1,0 +1,3 @@
+[submodule "submodules/PaddleOCR"]
+	path = submodules/PaddleOCR
+	url = https://gitlab.com/leonard.ung/paddleocr.git
