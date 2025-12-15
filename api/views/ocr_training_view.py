@@ -59,6 +59,7 @@ KIE_CONFIG_PATH = (
 PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
 MEDIA_PROJECT_ROOT = Path(settings.MEDIA_ROOT) / "projects"
 PRETRAIN_ROOT = Path(settings.MEDIA_ROOT) / "pretrain_models"
+LOG_PATH_ROOT = str(Path(settings.BASE_DIR).resolve())
 
 
 def _ensure_dir(path: Path):
@@ -77,6 +78,12 @@ def _clean_text(text: str) -> str:
     if text is None:
         return ""
     return str(text).replace("\t", " ").replace("\n", " ").strip()
+
+
+def _sanitize_log_line(line: str) -> str:
+    if not line:
+        return line
+    return line.replace(LOG_PATH_ROOT, "...")
 
 
 def _expand_samples(split_samples: List[dict], target: int) -> List[dict]:
@@ -130,6 +137,12 @@ def _load_model_defaults(config_path: Path) -> dict:
 
 
 def _serialize_job(job: "TrainingJob") -> dict:
+    logs_content = ""
+    if job.log_path and job.log_path.exists():
+        try:
+            logs_content = _sanitize_log_line(job.log_path.read_text(encoding="utf-8"))
+        except Exception:
+            logs_content = ""
     return {
         "id": job.id,
         "status": job.status,
@@ -140,6 +153,7 @@ def _serialize_job(job: "TrainingJob") -> dict:
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "dataset": job.dataset_info or {},
         "config": job.config_used,
+        "logs": logs_content,
     }
 
 
@@ -161,12 +175,13 @@ class TrainingJob:
 
     def append_log(self, line: str, persist: bool = True):
         if line:
-            self.log_tail.append(line.rstrip())
+            clean_line = _sanitize_log_line(line)
+            self.log_tail.append(clean_line.rstrip())
             self.log_tail = self.log_tail[-40:]
             self.message = "\n".join(self.log_tail[-10:])
         if persist and self.log_path:
             with self.log_path.open("a", encoding="utf-8") as fp:
-                fp.write(line)
+                fp.write(_sanitize_log_line(line))
 
 
 class OcrTrainingDefaultsView(APIView):
