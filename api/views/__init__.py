@@ -4,6 +4,9 @@ from .segmentation_image_view import SegmentationImageViewSet
 from .ocr_image_view import OcrImageViewSet
 from .ocr_training_view import (
     OcrTrainingDefaultsView,
+    OcrTrainingJobListView,
+    OcrTrainingJobLogsView,
+    OcrTrainingJobStopView,
     OcrTrainingJobView,
     OcrTrainingStartView,
 )
@@ -16,6 +19,9 @@ __all__ = [
     "SegmentationImageViewSet",
     "OcrImageViewSet",
     "OcrTrainingDefaultsView",
+    "OcrTrainingJobListView",
+    "OcrTrainingJobLogsView",
+    "OcrTrainingJobStopView",
     "OcrTrainingJobView",
     "OcrTrainingStartView",
     "VideoViewSet",

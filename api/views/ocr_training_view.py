@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Dict, Iterable, List, Optional
 
 import yaml
 from django.conf import settings
-from django.http import JsonResponse
+from django.http import FileResponse, JsonResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -60,6 +61,12 @@ PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
 MEDIA_PROJECT_ROOT = Path(settings.MEDIA_ROOT) / "projects"
 PRETRAIN_ROOT = Path(settings.MEDIA_ROOT) / "pretrain_models"
 LOG_PATH_ROOT = str(Path(settings.BASE_DIR).resolve())
+
+# Shared in-memory state for coordinating training runs.
+TRAINING_JOBS: Dict[str, "TrainingJob"] = {}
+TRAINING_QUEUE: deque[str] = deque()
+TRAINING_LOCK = threading.Lock()
+CURRENT_JOB_ID: Optional[str] = None
 
 
 def _ensure_dir(path: Path):
@@ -136,24 +143,54 @@ def _load_model_defaults(config_path: Path) -> dict:
     }
 
 
-def _serialize_job(job: "TrainingJob") -> dict:
+def _extract_global_cfg(config: Optional[dict]) -> dict:
+    config = config or {}
+    explicit_global = config.get("global") or {}
+    if explicit_global:
+        return explicit_global
+    # Backwards compatibility: allow top-level global keys.
+    return {
+        key: config.get(key)
+        for key in ("use_gpu", "test_ratio", "train_seed", "split_seed")
+        if config.get(key) is not None
+    }
+
+
+def _check_stop(job: "TrainingJob"):
+    if job.stop_requested:
+        raise TrainingCancelled()
+
+
+def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
     logs_content = ""
-    if job.log_path and job.log_path.exists():
+    if include_logs and job.log_path and job.log_path.exists():
         try:
             logs_content = _sanitize_log_line(job.log_path.read_text(encoding="utf-8"))
         except Exception:
             logs_content = ""
+    with TRAINING_LOCK:
+        queue_position: Optional[int] = None
+        if job.status == "waiting":
+            try:
+                queue_position = list(TRAINING_QUEUE).index(job.id) + 1
+            except ValueError:
+                queue_position = None
+        elif CURRENT_JOB_ID == job.id:
+            queue_position = 0
     return {
         "id": job.id,
         "status": job.status,
         "message": job.message,
         "error": job.error,
         "targets": job.targets,
+        "queue_position": queue_position,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
         "dataset": job.dataset_info or {},
         "config": job.config_used,
-        "logs": logs_content,
+        "log_available": bool(job.log_path and job.log_path.exists()),
+        "logs": logs_content if include_logs else None,
     }
 
 
@@ -163,6 +200,7 @@ class TrainingJob:
     user_id: int
     project_id: int
     targets: List[str]
+    created_at: datetime = field(default_factory=datetime.utcnow)
     status: str = "pending"
     message: str = ""
     error: Optional[str] = None
@@ -172,6 +210,10 @@ class TrainingJob:
     config_used: Optional[dict] = None
     log_tail: List[str] = field(default_factory=list)
     log_path: Optional[Path] = None
+    config_raw: dict = field(default_factory=dict)
+    stop_requested: bool = False
+    thread: Optional[threading.Thread] = field(default=None, repr=False)
+    current_process: Optional[subprocess.Popen] = field(default=None, repr=False)
 
     def append_log(self, line: str, persist: bool = True):
         if line:
@@ -182,6 +224,78 @@ class TrainingJob:
         if persist and self.log_path:
             with self.log_path.open("a", encoding="utf-8") as fp:
                 fp.write(_sanitize_log_line(line))
+
+
+class TrainingCancelled(Exception):
+    """Raised when a training run is intentionally stopped by the user."""
+
+
+def _finish_job(job: "TrainingJob", status_value: str, error: Optional[str] = None):
+    job.status = status_value
+    job.error = error
+    job.finished_at = datetime.utcnow()
+
+
+def _start_next_job_locked():
+    global CURRENT_JOB_ID
+    if CURRENT_JOB_ID is not None or not TRAINING_QUEUE:
+        return
+    while TRAINING_QUEUE:
+        next_job_id = TRAINING_QUEUE.popleft()
+        job = TRAINING_JOBS.get(next_job_id)
+        if not job:
+            continue
+        if job.stop_requested:
+            _finish_job(job, "stopped", error=job.error or "Stopped before start.")
+            continue
+        CURRENT_JOB_ID = job.id
+        job.status = "running"
+        job.started_at = datetime.utcnow()
+        job.thread = threading.Thread(
+            target=_run_training_wrapper, kwargs={"job": job}, daemon=True
+        )
+        job.thread.start()
+        break
+
+
+def _enqueue_job(job: "TrainingJob", config: dict):
+    job.config_raw = config or {}
+    job.status = "waiting"
+    job.append_log("Queued for training.\n")
+    with TRAINING_LOCK:
+        TRAINING_QUEUE.append(job.id)
+        _start_next_job_locked()
+
+
+def _release_and_start_next(job_id: str):
+    with TRAINING_LOCK:
+        global CURRENT_JOB_ID
+        if CURRENT_JOB_ID == job_id:
+            CURRENT_JOB_ID = None
+        _start_next_job_locked()
+
+
+def _stop_job(job: "TrainingJob"):
+    if job.status in ("completed", "failed", "stopped"):
+        return
+    job.stop_requested = True
+    job.append_log("Stop requested by user.\n")
+    with TRAINING_LOCK:
+        if job.status == "waiting":
+            try:
+                TRAINING_QUEUE.remove(job.id)
+            except ValueError:
+                pass
+            _finish_job(job, "stopped", error="Stopped by user.")
+            return
+    if job.status == "running" and job.current_process:
+        proc = job.current_process
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 class OcrTrainingDefaultsView(APIView):
@@ -222,7 +336,57 @@ class OcrTrainingJobView(APIView):
             return JsonResponse(
                 {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
             )
+        return JsonResponse(
+            {"job": _serialize_job(job, include_logs=True)},
+            status=status.HTTP_200_OK,
+        )
+
+
+class OcrTrainingJobListView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        jobs = [job for job in TRAINING_JOBS.values() if job.user_id == request.user.id]
+        jobs_sorted = sorted(jobs, key=lambda j: j.created_at, reverse=True)
+        return JsonResponse(
+            {"jobs": [_serialize_job(job) for job in jobs_sorted]},
+            status=status.HTTP_200_OK,
+        )
+
+
+class OcrTrainingJobStopView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def post(self, request, job_id: str):
+        job = TRAINING_JOBS.get(job_id)
+        if not job or job.user_id != request.user.id:
+            return JsonResponse(
+                {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        _stop_job(job)
         return JsonResponse({"job": _serialize_job(job)}, status=status.HTTP_200_OK)
+
+
+class OcrTrainingJobLogsView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request, job_id: str):
+        job = TRAINING_JOBS.get(job_id)
+        if not job or job.user_id != request.user.id:
+            return JsonResponse(
+                {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        if not job.log_path or not job.log_path.exists():
+            return JsonResponse(
+                {"error": "Log not found for this job."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return FileResponse(
+            job.log_path.open("rb"), as_attachment=True, filename=f"{job.id}.log"
+        )
 
 
 class OcrTrainingStartView(APIView):
@@ -265,59 +429,81 @@ class OcrTrainingStartView(APIView):
             log_path=job_log_dir / f"{job_id}.log",
         )
         TRAINING_JOBS[job_id] = job
+        job.config_used = {
+            "global": _extract_global_cfg(config),
+            "models": config.get("models") or {},
+        }
 
-        # Fire off background work.
-        thread = threading.Thread(
-            target=_run_training,
-            kwargs={
-                "job": job,
-                "project": project,
-                "config": config,
-            },
-            daemon=True,
-        )
-        thread.start()
+        _enqueue_job(job, config)
 
         return JsonResponse(
             {"job": _serialize_job(job)}, status=status.HTTP_202_ACCEPTED
         )
 
 
-def _run_training(job: TrainingJob, project: Project, config: dict):
-    job.started_at = datetime.utcnow()
-    job.status = "running"
-    job.append_log(f"Starting training job {job.id} for project {project.id}\n")
-
+def _run_training(job: TrainingJob):
     try:
-        dataset_info = _prepare_datasets(project, config)
-        job.dataset_info = dataset_info
-        job.append_log(f"Prepared datasets at {dataset_info.get('dataset_dir', '')}\n")
-    except Exception as exc:
-        log.exception("Failed to prepare datasets: %s", exc)
-        job.error = f"Dataset preparation failed: {exc}"
-        job.status = "failed"
-        job.finished_at = datetime.utcnow()
-        return
-
-    overrides = config.get("models") or {}
-    global_cfg = config.get("global") or {}
-    job.config_used = {"global": global_cfg, "models": overrides}
-
-    success = True
-    for target in job.targets:
         try:
-            _train_model(target, project, dataset_info, global_cfg, overrides, job)
-        except Exception as exc:
-            log.exception("Training for %s failed: %s", target, exc)
-            job.append_log(f"[{target}] failed: {exc}\n")
-            job.error = str(exc)
-            success = False
-            break
+            project = Project.objects.get(id=job.project_id, user_id=job.user_id)
+        except Project.DoesNotExist:
+            _finish_job(job, "failed", error="Project not found for this job.")
+            return
 
-    job.status = "completed" if success else "failed"
-    job.finished_at = datetime.utcnow()
-    if success:
-        job.append_log("Training completed.\n")
+        config = job.config_raw or {}
+        global_cfg = _extract_global_cfg(config)
+        overrides = config.get("models") or {}
+        config_for_dataset = dict(config)
+        for key, value in global_cfg.items():
+            config_for_dataset.setdefault(key, value)
+        job.config_used = {"global": global_cfg, "models": overrides}
+
+        try:
+            _check_stop(job)
+            job.append_log(f"Starting training job {job.id} for project {project.id}\n")
+            dataset_info = _prepare_datasets(project, config_for_dataset)
+            job.dataset_info = dataset_info
+            job.append_log(
+                f"Prepared datasets at {dataset_info.get('dataset_dir', '')}\n"
+            )
+        except TrainingCancelled:
+            _finish_job(job, "stopped", error="Stopped by user.")
+            job.append_log("Training stopped.\n")
+            return
+        except Exception as exc:
+            log.exception("Failed to prepare datasets: %s", exc)
+            _finish_job(job, "failed", error=f"Dataset preparation failed: {exc}")
+            return
+
+        success = True
+        for target in job.targets:
+            try:
+                _check_stop(job)
+                _train_model(target, project, dataset_info, global_cfg, overrides, job)
+            except TrainingCancelled:
+                success = False
+                _finish_job(job, "stopped", error="Stopped by user.")
+                job.append_log("Training stopped.\n")
+                break
+            except Exception as exc:
+                log.exception("Training for %s failed: %s", target, exc)
+                job.append_log(f"[{target}] failed: {exc}\n")
+                job.error = str(exc)
+                success = False
+                _finish_job(job, "failed", error=str(exc))
+                break
+
+        if success:
+            job.append_log("Training completed.\n")
+            _finish_job(job, "completed")
+    finally:
+        job.current_process = None
+
+
+def _run_training_wrapper(job: TrainingJob):
+    try:
+        _run_training(job)
+    finally:
+        _release_and_start_next(job.id)
 
 
 def _prepare_datasets(project: Project, config: dict) -> dict:
@@ -455,7 +641,9 @@ def _write_recognition_dataset(dataset_root: Path, train_samples, val_samples):
                     crop_name = f"{Path(sample['filename']).stem}_{idx}.png"
                     crop_path = out_dir / crop_name
                     crop.save(crop_path)
-                    rows.append(f"{crop_name}\t{_clean_text(shape['text'])}")
+                    rows.append(
+                        f"{'/'.join(crop_path.parts[-2:])}\t{_clean_text(shape['text'])}"
+                    )
         label_path.write_text("\n".join(rows), encoding="utf-8")
 
     _write(train_samples, train_dir, train_label)
@@ -533,6 +721,7 @@ def _train_model(
     overrides: dict,
     job: TrainingJob,
 ):
+    _check_stop(job)
     cfg_path = {
         "det": DET_CONFIG_PATH,
         "rec": REC_CONFIG_PATH,
@@ -586,9 +775,9 @@ def _train_model(
             [
                 f"Architecture.Backbone.checkpoints={PRETRAIN_ROOT / 'ser_LayoutXLM_xfun_zh'}",
                 f"Global.save_model_dir={models_dir}",
-                f"Train.dataset.data_dir={kie['data_dir'] / 'zh_train'}",
+                f"Train.dataset.data_dir={kie['data_dir'] + '/zh_train'}",
                 f"Train.dataset.label_file_list=['{kie['train_label']}']",
-                f"Eval.dataset.data_dir={kie['data_dir'] / 'zh_val'}",
+                f"Eval.dataset.data_dir={kie['data_dir'] + '/zh_val'}",
                 f"Eval.dataset.label_file_list=['{kie['val_label']}']",
                 f"PostProcess.class_path={kie['class_path']}",
             ]
@@ -615,12 +804,22 @@ def _train_model(
         text=True,
         env=paddle_env,
     )
-    assert process.stdout is not None
-    for line in process.stdout:
-        job.append_log(f"[{target}] {line}", persist=True)
-    ret = process.wait()
-    if ret != 0:
-        raise RuntimeError(f"{target} training exited with code {ret}")
-
-
-TRAINING_JOBS: Dict[str, TrainingJob] = {}
+    job.current_process = process
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if job.stop_requested:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise TrainingCancelled()
+            job.append_log(f"[{target}] {line}", persist=True)
+        ret = process.wait()
+        if job.stop_requested:
+            raise TrainingCancelled()
+        if ret != 0:
+            raise RuntimeError(f"{target} training exited with code {ret}")
+    finally:
+        job.current_process = None

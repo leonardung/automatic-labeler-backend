@@ -5,6 +5,9 @@ from api.views import (
     ModelManagerViewSet,
     OcrImageViewSet,
     OcrTrainingDefaultsView,
+    OcrTrainingJobListView,
+    OcrTrainingJobLogsView,
+    OcrTrainingJobStopView,
     OcrTrainingJobView,
     OcrTrainingStartView,
     ProjectViewSet,
@@ -25,4 +28,7 @@ urlpatterns = [
     path("ocr-training/defaults/", OcrTrainingDefaultsView.as_view(), name="ocr-training-defaults"),
     path("ocr-training/start/", OcrTrainingStartView.as_view(), name="ocr-training-start"),
     path("ocr-training/jobs/<str:job_id>/", OcrTrainingJobView.as_view(), name="ocr-training-job"),
+    path("ocr-training/jobs/", OcrTrainingJobListView.as_view(), name="ocr-training-jobs"),
+    path("ocr-training/jobs/<str:job_id>/stop/", OcrTrainingJobStopView.as_view(), name="ocr-training-job-stop"),
+    path("ocr-training/jobs/<str:job_id>/logs/", OcrTrainingJobLogsView.as_view(), name="ocr-training-job-logs"),
 ]

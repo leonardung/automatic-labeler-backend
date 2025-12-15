@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from typing import Optional
 
 import numpy as np
-import torch
 from PIL import Image
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -24,12 +23,16 @@ from .base_image_view import BaseImageViewSet
 
 try:
     from sam3.model_builder import build_sam3_video_model
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 except ImportError:  # pragma: no cover - safeguards environments without SAM3 installed
+
     def build_sam3_video_model(*args, **kwargs):
-        raise ImportError("sam3 is not installed; build_sam3_video_model is unavailable.")
+        raise ImportError(
+            "sam3 is not installed; build_sam3_video_model is unavailable."
+        )
 
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 SAM3_CHECKPOINT_PATH = os.getenv("SAM3_CHECKPOINT_PATH")
 SAM3_BPE_PATH = os.getenv("SAM3_BPE_PATH")
