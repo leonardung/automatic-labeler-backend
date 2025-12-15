@@ -363,16 +363,13 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
 
 def _write_detection_dataset(dataset_root: Path, train_samples, val_samples):
     det_root = _ensure_dir(dataset_root / "det")
-    img_dir = _ensure_dir(det_root / "images")
     train_label = det_root / "train.txt"
     val_label = det_root / "val.txt"
 
     def _write(split_samples: List[dict], target_label: Path):
         lines = []
         for sample in split_samples:
-            target_img = img_dir / sample["filename"]
-            if not target_img.exists():
-                shutil.copy2(sample["image_path"], target_img)
+            rel_path = Path(os.path.relpath(sample["image_path"], start=det_root))
             det_shapes = []
             for shape in sample["shapes"]:
                 points = [
@@ -387,7 +384,7 @@ def _write_detection_dataset(dataset_root: Path, train_samples, val_samples):
                     }
                 )
             lines.append(
-                f"images/{sample['filename']}\t{json.dumps(det_shapes, ensure_ascii=False)}"
+                f"{rel_path.as_posix()}\t{json.dumps(det_shapes, ensure_ascii=False)}"
             )
         target_label.write_text("\n".join(lines), encoding="utf-8")
 
@@ -448,16 +445,15 @@ def _write_kie_dataset(dataset_root: Path, train_samples, val_samples):
     class_list_path.write_text("\n".join(sorted(categories)), encoding="utf-8")
 
     def _write(split_samples, name: str):
-        image_dir = _ensure_dir(kie_root / name / "image")
         manifest_path = (
             _ensure_dir(kie_root / name)
             / f"{'train' if name=='zh_train' else 'val'}.json"
         )
         manifest = []
         for sample in split_samples:
-            target_img = image_dir / sample["filename"]
-            if not target_img.exists():
-                shutil.copy2(sample["image_path"], target_img)
+            rel_img = Path(
+                os.path.relpath(sample["image_path"], start=manifest_path.parent)
+            )
             ocr_info = []
             for shape in sample["shapes"]:
                 bbox = shape.get("bbox") or _bbox_from_points(shape["points"])
@@ -473,7 +469,7 @@ def _write_kie_dataset(dataset_root: Path, train_samples, val_samples):
             manifest.append(
                 {
                     "id": sample["filename"],
-                    "img": f"image/{sample['filename']}",
+                    "img": rel_img.as_posix(),
                     "width": sample["width"],
                     "height": sample["height"],
                     "ocr_info": ocr_info,
