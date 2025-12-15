@@ -79,6 +79,22 @@ def _clean_text(text: str) -> str:
     return str(text).replace("\t", " ").replace("\n", " ").strip()
 
 
+def _expand_samples(split_samples: List[dict], target: int) -> List[dict]:
+    """
+    Duplicate samples until we reach target count. Keeps original order and cycles.
+    """
+    if not split_samples:
+        return []
+    if len(split_samples) >= target:
+        return split_samples
+    output = list(split_samples)
+    idx = 0
+    while len(output) < target:
+        output.append(split_samples[idx % len(split_samples)])
+        idx += 1
+    return output
+
+
 def _bbox_from_points(points: Iterable[dict]):
     xs, ys = [], []
     for pt in points:
@@ -343,6 +359,10 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     train_samples = samples[:split_idx]
     val_samples = samples[split_idx:] or samples[:1]
 
+    # Duplicate to desired dataset sizes
+    train_samples = _expand_samples(train_samples, 100)
+    val_samples = _expand_samples(val_samples, 8)
+
     project_root = _ensure_dir(MEDIA_PROJECT_ROOT / str(project.id))
     dataset_root = _ensure_dir(project_root / "datasets")
 
@@ -352,8 +372,8 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
 
     return {
         "label_file": str(det_info["train_label"]),
-        "samples": len(samples),
-        "annotations": sum(len(s["shapes"]) for s in samples),
+        "samples": len(train_samples) + len(val_samples),
+        "annotations": sum(len(s["shapes"]) for s in train_samples + val_samples),
         "dataset_dir": str(dataset_root),
         "det": det_info,
         "rec": rec_info,
