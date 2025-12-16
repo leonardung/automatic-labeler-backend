@@ -235,7 +235,6 @@ def _augment_file_per_grid(
             if not line:
                 continue
             img_path, ann_json = line.split("\t", 1)
-            print(f"{img_path=}")
             anns = json.loads(ann_json)
             anns = sort_annotations(anns)
 
@@ -250,18 +249,15 @@ def _augment_file_per_grid(
 
             wrote_any = False
             for ml, mo in product(max_lens, min_overlaps):
-                print(ml, mo)
                 if ml <= mo:
                     continue
 
-                print(111, "split")
                 parts = split_by_token_budget(
                     new_anns,
                     tokenizer,
                     max_seq_len=int(ml),
                     min_token_overlap=int(mo),
                 )
-                print(2222)
                 if not parts:
                     continue
                 wrote_any = True
@@ -270,7 +266,6 @@ def _augment_file_per_grid(
 
             if not wrote_any:
                 fout.write(f"{img_path}\t{json.dumps(new_anns, ensure_ascii=False)}\n")
-            print(f"{wrote_any=}")
 
 
 def _load_model_defaults(config_path: Path) -> dict:
