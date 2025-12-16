@@ -203,7 +203,13 @@ def split_by_token_budget(
                 and range_tokens(start_prime, end) >= min_token_overlap
             ):
                 start_prime += 1
-            start = max(start_prime - 1, start)
+
+            if start_prime == start:
+                # Not enough tokens to satisfy the overlap requirement; move past this window.
+                start = end
+            else:
+                # start_prime - 1 keeps the overlap condition; ensure we still progress.
+                start = max(start_prime - 1, start + 1)
     return out
 
 
@@ -819,13 +825,12 @@ def _write_kie_dataset(
     """
     kie_root = _ensure_dir(dataset_root / "kie" / "train_data")
     class_list_path = kie_root / "class_list.txt"
-    categories = set()
+    # Always include a catch-all class so empty/missing labels map safely.
+    categories = {"others"}
     for sample in train_samples + val_samples:
         for shape in sample["shapes"]:
             if shape["category"]:
                 categories.add(shape["category"])
-    if not categories:
-        categories.add("others")
     class_list_path.write_text("\n".join(sorted(categories)), encoding="utf-8")
 
     kie_cfg = (config.get("models") or {}).get("kie") or {}
@@ -862,10 +867,11 @@ def _write_kie_dataset(
                 ]
         if len(pts) < 4:
             return None
+        category = shape.get("category") or "others"
         return {
             "transcription": _clean_text(shape.get("text", "")),
             "points": pts,
-            "key_cls": shape.get("category") or "",
+            "key_cls": category,
         }
 
     def _write_raw(split_samples, target_path: Path):
@@ -978,7 +984,9 @@ def _train_model(
         )
     elif target == "kie":
         kie = dataset_info["kie"]
-        num_classes = max(1, int(kie.get("num_classes") or 0))
+        class_count = max(1, int(kie.get("num_classes") or 0))
+        # SER labels use B-*, I-* plus O -> 2 * class_count + 1.
+        ser_label_classes = int(2 * class_count + 1)
         images_folder = global_cfg.get("images_folder") or kie.get("images_dir")
         if not images_folder:
             raise RuntimeError("Images folder is required for KIE training.")
@@ -1000,8 +1008,8 @@ def _train_model(
                 f"Train.dataset.transforms.1.VQATokenLabelEncode.class_path={kie_model_cfg['class_path']}",
                 f"Eval.dataset.transforms.1.VQATokenLabelEncode.class_path={kie_model_cfg['class_path']}",
                 f"Architecture.Backbone.pretrained={kie_model_cfg['pretrained_model']}",
-                f"Architecture.Backbone.num_classes={int(2 * num_classes - 1)}",
-                f"Loss.num_classes={int(2 * num_classes - 1)}",
+                f"Architecture.Backbone.num_classes={ser_label_classes}",
+                f"Loss.num_classes={ser_label_classes}",
                 f"Train.dataset.data_dir={images_folder}",
                 f"Train.dataset.label_file_list={kie_model_cfg['dataset_train']}",
                 "Train.dataset.ratio_list=1",
