@@ -10,8 +10,9 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import product
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
 from django.conf import settings
@@ -124,6 +125,146 @@ def _bbox_from_points(points: Iterable[dict]):
     if min_x == max_x or min_y == max_y:
         return None
     return [min_x, min_y, max_x, max_y]
+
+
+def sort_annotations(
+    annotations: List[Dict[str, Any]], reverse: bool = False
+) -> List[Dict[str, Any]]:
+    def _key(ann: Dict[str, Any]):
+        try:
+            return ann["points"][0][1]
+        except Exception:
+            return 0
+
+    return sorted(annotations, key=_key, reverse=reverse)
+
+
+def token_len(text: str, tokenizer) -> int:
+    """
+    Count subword tokens for a single 'word box' text as the KIE model will see it.
+    """
+    if not text:
+        return 0
+    return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def split_by_token_budget(
+    annotations: List[Dict[str, Any]],
+    tokenizer,
+    max_seq_len: int,
+    min_token_overlap: int = 0,
+):
+    """
+    Chunk 'annotations' (already in reading order) into windows that fit the token budget.
+    Each window satisfies: sum(tokens) + 2 <= max_seq_len   (# +2 for [CLS], [SEP]).
+    Overlap is measured in TOKENS (not boxes) between consecutive windows.
+    """
+
+    if max_seq_len <= 2:
+        raise ValueError("max_seq_len must be > 2")
+    if min_token_overlap < 0:
+        raise ValueError("min_token_overlap must be >= 0")
+
+    tok_counts = [
+        token_len(ann.get("transcription", ""), tokenizer) for ann in annotations
+    ]
+    n = len(annotations)
+    if n == 0:
+        return []
+
+    budget = max_seq_len - 2  # [CLS], [SEP]
+    prefix = [0]
+    for t in tok_counts:
+        prefix.append(prefix[-1] + t)
+
+    def range_tokens(i, j):
+        return prefix[j] - prefix[i]
+
+    out = []
+    start = 0
+    while start < n:
+        end = start
+        while end < n and range_tokens(start, end + 1) <= budget:
+            end += 1
+        if end == start:
+            end = min(start + 1, n)
+
+        out.append(annotations[start:end])
+
+        if end >= n:
+            break
+
+        if min_token_overlap == 0:
+            start = end
+        else:
+            start_prime = start
+            while (
+                start_prime < end
+                and range_tokens(start_prime, end) >= min_token_overlap
+            ):
+                start_prime += 1
+            start = max(start_prime - 1, start)
+    return out
+
+
+def _augment_file_per_grid(
+    src_file: str, dst_file: str, max_lens, min_overlaps, tokenizer
+):
+    """Read src_file (un-augmented), write dst_file (augmented) across all param combos."""
+    if not isinstance(max_lens, (list, tuple)):
+        max_lens = [max_lens]
+    if not isinstance(min_overlaps, (list, tuple)):
+        min_overlaps = [min_overlaps]
+    if not max_lens or not min_overlaps:
+        raise ValueError(
+            "models.kie.max_len_per_part and models.kie.min_overlap must be provided "
+            "as a scalar or list with at least one value."
+        )
+
+    with open(src_file, "r", encoding="utf-8") as fin, open(
+        dst_file, "w", encoding="utf-8"
+    ) as fout:
+        for line in fin:
+            line = line.strip()
+            if not line:
+                continue
+            img_path, ann_json = line.split("\t", 1)
+            print(f"{img_path=}")
+            anns = json.loads(ann_json)
+            anns = sort_annotations(anns)
+
+            new_anns: List[Dict[str, Any]] = [
+                {
+                    "transcription": a.get("transcription", ""),
+                    "points": a.get("points", []),
+                    "label": a.get("key_cls", ""),
+                }
+                for a in anns
+            ]
+
+            wrote_any = False
+            for ml, mo in product(max_lens, min_overlaps):
+                print(ml, mo)
+                if ml <= mo:
+                    continue
+
+                print(111, "split")
+                parts = split_by_token_budget(
+                    new_anns,
+                    tokenizer,
+                    max_seq_len=int(ml),
+                    min_token_overlap=int(mo),
+                )
+                print(2222)
+                if not parts:
+                    continue
+                wrote_any = True
+                for part in parts:
+                    fout.write(f"{img_path}\t{json.dumps(part, ensure_ascii=False)}\n")
+
+            if not wrote_any:
+                fout.write(f"{img_path}\t{json.dumps(new_anns, ensure_ascii=False)}\n")
+            print(f"{wrote_any=}")
 
 
 def _load_model_defaults(config_path: Path) -> dict:
@@ -563,8 +704,8 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     val_samples = samples[split_idx:] or samples[:1]
 
     # Duplicate to desired dataset sizes
-    train_samples = _expand_samples(train_samples, 100)
-    val_samples = _expand_samples(val_samples, 8)
+    # train_samples = _expand_samples(train_samples, 100)
+    # val_samples = _expand_samples(val_samples, 8)
 
     project_root = _ensure_dir(MEDIA_PROJECT_ROOT / str(project.id))
     dataset_root = _ensure_dir(project_root / "datasets")
@@ -573,7 +714,11 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     rec_info = _write_recognition_dataset(dataset_root, train_samples, val_samples)
     images_root = Path(train_samples[0]["image_path"]).parent
     kie_info = _write_kie_dataset(
-        dataset_root, train_samples, val_samples, images_root=images_root
+        dataset_root,
+        train_samples,
+        val_samples,
+        images_root=images_root,
+        config=config,
     )
 
     return {
@@ -662,8 +807,16 @@ def _write_recognition_dataset(dataset_root: Path, train_samples, val_samples):
 
 
 def _write_kie_dataset(
-    dataset_root: Path, train_samples, val_samples, images_root: Path
+    dataset_root: Path,
+    train_samples,
+    val_samples,
+    images_root: Path,
+    config: dict,
 ):
+    """
+    Generate SER/KIE dataset files in the expected PaddleOCR txt format:
+    one sample per line: <image_path>\t<json anns>.
+    """
     kie_root = _ensure_dir(dataset_root / "kie" / "train_data")
     class_list_path = kie_root / "class_list.txt"
     categories = set()
@@ -675,44 +828,93 @@ def _write_kie_dataset(
         categories.add("others")
     class_list_path.write_text("\n".join(sorted(categories)), encoding="utf-8")
 
-    def _write(split_samples, filename: str):
-        manifest_path = kie_root / filename
-        manifest = []
+    kie_cfg = (config.get("models") or {}).get("kie") or {}
+    train_cfg = kie_cfg.get("train") or {}
+    test_cfg = kie_cfg.get("test") or {}
+
+    max_lens_train = train_cfg.get("max_len_per_part", [30, 40, 43, 45, 47])
+    min_overlaps_train = train_cfg.get("min_overlap", [0, 5, 7, 10, 13, 15])
+    max_lens_test = test_cfg.get("max_len_per_part", [30, 40, 50, 60])
+    min_overlaps_test = test_cfg.get("min_overlap", [0, 10, 15, 20])
+
+    train_raw = kie_root / "train.txt.src"
+    val_raw = kie_root / "val.txt.src"
+    train_txt = kie_root / "train.txt"
+    val_txt = kie_root / "val.txt"
+
+    def _shape_to_ann(shape: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        raw_points = shape.get("points") or []
+        pts: List[List[int]] = []
+        for pt in raw_points:
+            try:
+                pts.append([_safe_int(pt.get("x")), _safe_int(pt.get("y"))])
+            except Exception:
+                continue
+        if len(pts) < 4:
+            bbox = shape.get("bbox") or _bbox_from_points(raw_points)
+            if bbox:
+                min_x, min_y, max_x, max_y = bbox
+                pts = [
+                    [min_x, min_y],
+                    [max_x, min_y],
+                    [max_x, max_y],
+                    [min_x, max_y],
+                ]
+        if len(pts) < 4:
+            return None
+        return {
+            "transcription": _clean_text(shape.get("text", "")),
+            "points": pts,
+            "key_cls": shape.get("category") or "",
+        }
+
+    def _write_raw(split_samples, target_path: Path):
+        rows = []
         for sample in split_samples:
             rel_img = Path(os.path.relpath(sample["image_path"], start=images_root))
-            ocr_info = []
+            anns = []
             for shape in sample["shapes"]:
-                bbox = shape.get("bbox") or _bbox_from_points(shape["points"])
-                if not bbox:
-                    continue
-                ocr_info.append(
-                    {
-                        "text": _clean_text(shape["text"]),
-                        "bbox": bbox,
-                        "label": shape["category"] or "others",
-                    }
-                )
-            manifest.append(
-                {
-                    "id": sample["filename"],
-                    "img": rel_img.as_posix(),
-                    "width": sample["width"],
-                    "height": sample["height"],
-                    "ocr_info": ocr_info,
-                }
-            )
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
-        )
-        return manifest_path
+                ann = _shape_to_ann(shape)
+                if ann:
+                    anns.append(ann)
+            if not anns:
+                continue
+            rows.append(f"{rel_img.as_posix()}\t{json.dumps(anns, ensure_ascii=False)}")
+        target_path.write_text("\n".join(rows), encoding="utf-8")
 
-    train_json = _write(train_samples, "train.json")
-    val_json = _write(val_samples, "val.json")
+    _write_raw(train_samples, train_raw)
+    _write_raw(val_samples, val_raw)
+
+    from paddlenlp.transformers import LayoutLMv2Tokenizer
+
+    tokenizer = LayoutLMv2Tokenizer.from_pretrained("layoutlmv2-base-uncased")
+
+    _augment_file_per_grid(
+        src_file=str(train_raw),
+        dst_file=str(train_txt),
+        max_lens=max_lens_train,
+        min_overlaps=min_overlaps_train,
+        tokenizer=tokenizer,
+    )
+    _augment_file_per_grid(
+        src_file=str(val_raw),
+        dst_file=str(val_txt),
+        max_lens=max_lens_test,
+        min_overlaps=min_overlaps_test,
+        tokenizer=tokenizer,
+    )
+
+    for temp_file in (train_raw, val_raw):
+        try:
+            os.remove(temp_file)
+        except OSError:
+            pass
+
     return {
         "data_dir": str(kie_root),
         "images_dir": str(images_root),
-        "train_label": str(train_json),
-        "val_label": str(val_json),
+        "train_label": str(train_txt),
+        "val_label": str(val_txt),
         "class_path": str(class_list_path),
         "num_classes": len(categories),
     }
@@ -786,9 +988,7 @@ def _train_model(
         val_label_path = Path(kie["val_label"]).as_posix()
         kie_model_cfg = {
             "class_path": class_path,
-            "pretrained_model": (
-                PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh"
-            ).as_posix(),
+            "pretrained_model": (PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh").as_posix(),
             "dataset_train": f'["{train_label_path}"]',
             "dataset_val": f'["{val_label_path}"]',
         }
