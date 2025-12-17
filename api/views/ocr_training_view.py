@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import yaml
 from django.conf import settings
 from django.http import FileResponse, JsonResponse
+from django.db.models import Count
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
@@ -137,6 +138,31 @@ def sort_annotations(
             return 0
 
     return sorted(annotations, key=_key, reverse=reverse)
+
+
+def _dataset_snapshot(project: Project) -> dict:
+    """
+    Summarize dataset stats without writing any files.
+    """
+    total_images = ImageModel.objects.filter(project=project).count()
+    annotated = OcrAnnotation.objects.filter(image__project=project)
+    images_with_labels = annotated.values("image_id").distinct().count()
+    category_rows = annotated.values("category").annotate(total=Count("id"))
+    category_counts: List[dict] = []
+    total_boxes = 0
+    for row in category_rows:
+        label = row.get("category") or "Unlabeled"
+        count = int(row.get("total") or 0)
+        total_boxes += count
+        category_counts.append({"label": label, "count": count})
+    category_counts.sort(key=lambda item: item["count"], reverse=True)
+    return {
+        "images": images_with_labels,
+        "total_images": total_images,
+        "boxes": total_boxes,
+        "categories": category_counts,
+        "category_total": len(category_counts),
+    }
 
 
 def token_len(text: str, tokenizer) -> int:
@@ -468,6 +494,35 @@ class OcrTrainingDefaultsView(APIView):
         return JsonResponse({"defaults": defaults}, status=status.HTTP_200_OK)
 
 
+class OcrTrainingDatasetView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def get(self, request):
+        project_id = request.query_params.get("project_id")
+        if not project_id:
+            return JsonResponse(
+                {"error": "project_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return JsonResponse(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        try:
+            dataset = _dataset_snapshot(project)
+        except Exception as exc:
+            log.exception("Failed to collect dataset snapshot: %s", exc)
+            return JsonResponse(
+                {"error": "Unable to load dataset summary."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return JsonResponse({"dataset": dataset}, status=status.HTTP_200_OK)
+
+
 class OcrTrainingJobView(APIView):
     permission_classes = [IsAuthenticated]
     authentication_classes = [JWTAuthentication]
@@ -662,6 +717,9 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     )
 
     samples = []
+    total_images = images.count()
+    category_counts: Dict[str, int] = {}
+    total_boxes = 0
     for image in images:
         anns = list(image.ocr_annotations.all())
         if not anns:
@@ -684,6 +742,8 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
                     "category": ann.category or "",
                 }
             )
+            key = ann.category or "Unlabeled"
+            category_counts[key] = category_counts.get(key, 0) + 1
         samples.append(
             {
                 "image_path": image.image.path,
@@ -693,6 +753,7 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
                 "height": height,
             }
         )
+        total_boxes += len(shapes)
 
     if not samples:
         raise RuntimeError("No OCR annotations found for this project.")
@@ -728,6 +789,15 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
         "annotations": sum(len(s["shapes"]) for s in train_samples + val_samples),
         "dataset_dir": str(dataset_root),
         "images_dir": str(images_root),
+        "images": len(samples),
+        "total_images": total_images,
+        "boxes": total_boxes,
+        "categories": sorted(
+            [{"label": k, "count": v} for k, v in category_counts.items()],
+            key=lambda item: item["count"],
+            reverse=True,
+        ),
+        "category_total": len(category_counts),
         "det": det_info,
         "rec": rec_info,
         "kie": kie_info,
