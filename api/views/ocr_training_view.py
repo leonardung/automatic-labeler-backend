@@ -95,9 +95,9 @@ def _sanitize_log_line(line: str) -> str:
     return line.replace(LOG_PATH_ROOT, "...")
 
 
-def _expand_samples(split_samples: List[dict], target: int) -> List[dict]:
+def _expand_samples(split_samples: List[Any], target: int) -> List[Any]:
     """
-    Duplicate samples until we reach target count. Keeps original order and cycles.
+    Duplicate items until we reach target count. Keeps original order and cycles.
     """
     if not split_samples:
         return []
@@ -762,25 +762,29 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     split_idx = int(len(samples) * (1 - float(test_ratio)))
     if split_idx <= 0:
         split_idx = max(1, len(samples) - 1)
-    train_samples = samples[:split_idx]
-    val_samples = samples[split_idx:] or samples[:1]
+    base_train_samples = samples[:split_idx]
+    base_val_samples = samples[split_idx:] or samples[:1]
 
     # Duplicate to desired dataset sizes
-    # train_samples = _expand_samples(train_samples, 100)
-    # val_samples = _expand_samples(val_samples, 8)
+    train_target = 100
+    val_target = 8
+    train_samples = _expand_samples(base_train_samples, train_target)
+    val_samples = _expand_samples(base_val_samples, val_target)
 
     project_root = _ensure_dir(MEDIA_PROJECT_ROOT / str(project.id))
     dataset_root = _ensure_dir(project_root / "datasets")
 
     det_info = _write_detection_dataset(dataset_root, train_samples, val_samples)
     rec_info = _write_recognition_dataset(dataset_root, train_samples, val_samples)
-    images_root = Path(train_samples[0]["image_path"]).parent
+    images_root = Path(base_train_samples[0]["image_path"]).parent
     kie_info = _write_kie_dataset(
         dataset_root,
-        train_samples,
-        val_samples,
+        base_train_samples,
+        base_val_samples,
         images_root=images_root,
         config=config,
+        train_target=train_target,
+        val_target=val_target,
     )
 
     return {
@@ -883,6 +887,8 @@ def _write_kie_dataset(
     val_samples,
     images_root: Path,
     config: dict,
+    train_target: Optional[int] = None,
+    val_target: Optional[int] = None,
 ):
     """
     Generate SER/KIE dataset files in the expected PaddleOCR txt format:
@@ -974,6 +980,19 @@ def _write_kie_dataset(
         min_overlaps=min_overlaps_test,
         tokenizer=tokenizer,
     )
+
+    def _expand_augmented_file(target_path: Path, target_count: Optional[int]):
+        if not target_count or target_count <= 0:
+            return
+        raw_lines = target_path.read_text(encoding="utf-8").splitlines()
+        lines = [line for line in raw_lines if line.strip()]
+        if not lines:
+            return
+        expanded = _expand_samples(lines, int(target_count))
+        target_path.write_text("\n".join(expanded), encoding="utf-8")
+
+    _expand_augmented_file(train_txt, train_target)
+    _expand_augmented_file(val_txt, val_target)
 
     for temp_file in (train_raw, val_raw):
         try:
