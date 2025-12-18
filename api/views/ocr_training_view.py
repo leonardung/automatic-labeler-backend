@@ -947,10 +947,12 @@ def _write_kie_dataset(
     train_cfg = kie_cfg.get("train") or {}
     test_cfg = kie_cfg.get("test") or {}
 
-    max_lens_train = train_cfg.get("max_len_per_part", [30, 40, 43, 45, 47])
-    min_overlaps_train = train_cfg.get("min_overlap", [0, 5, 7, 10, 13, 15])
-    max_lens_test = test_cfg.get("max_len_per_part", [30, 40, 50, 60])
-    min_overlaps_test = test_cfg.get("min_overlap", [0, 10, 15, 20])
+    max_lens_train = train_cfg.get("max_len_per_part", [256, 512])
+    min_overlaps_train = train_cfg.get(
+        "min_overlap", [0, 32, 64, 96, 128, 160, 192, 224]
+    )
+    max_lens_test = test_cfg.get("max_len_per_part", [512])
+    min_overlaps_test = test_cfg.get("min_overlap", [64, 128])
 
     train_raw = kie_root / "train.txt.src"
     val_raw = kie_root / "val.txt.src"
@@ -1045,7 +1047,7 @@ def _write_kie_dataset(
         "train_label": str(train_txt),
         "val_label": str(val_txt),
         "class_path": str(class_list_path),
-        "num_classes": len(categories),
+        "num_classes": len(categories) - 1,
     }
 
 
