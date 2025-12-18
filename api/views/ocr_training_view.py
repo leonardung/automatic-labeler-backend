@@ -512,9 +512,9 @@ class OcrTrainingDefaultsView(APIView):
     def get(self, request):
         defaults = {
             "use_gpu": True,
-            "test_ratio": 0.05,
-            "train_seed": None,
-            "split_seed": None,
+            "test_ratio": 0.3,
+            "train_seed": 42,
+            "split_seed": 42,
             "paths": {
                 "config_path": str(DET_CONFIG_PATH),
                 "dataset_root": str(MEDIA_PROJECT_ROOT),
@@ -525,9 +525,24 @@ class OcrTrainingDefaultsView(APIView):
                 "pretrain_root": str(PRETRAIN_ROOT),
             },
             "models": {
-                "det": _load_model_defaults(DET_CONFIG_PATH),
-                "rec": _load_model_defaults(REC_CONFIG_PATH),
-                "kie": _load_model_defaults(KIE_CONFIG_PATH),
+                "det": {
+                    "epoch_num": 50,
+                    "print_batch_step": 10,
+                    "save_epoch_step": 1e111,
+                    "eval_batch_step": 200,
+                },
+                "rec": {
+                    "epoch_num": 50,
+                    "print_batch_step": 10,
+                    "save_epoch_step": 1e111,
+                    "eval_batch_step": 200,
+                },
+                "kie": {
+                    "epoch_num": 50,
+                    "print_batch_step": 10,
+                    "save_epoch_step": 1e111,
+                    "eval_batch_step": 200,
+                },
             },
         }
         return JsonResponse({"defaults": defaults}, status=status.HTTP_200_OK)
