@@ -120,6 +120,10 @@ def _public_dataset_info(dataset: Optional[dict]) -> dict:
     allowed_keys = {
         "samples",
         "annotations",
+        "train_samples",
+        "test_samples",
+        "train_annotations",
+        "test_annotations",
         "images",
         "total_images",
         "boxes",

@@ -465,6 +465,12 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     val_target = 8
     train_samples = _expand_samples(base_train_samples, train_target)
     val_samples = _expand_samples(base_val_samples, val_target)
+    train_count = len(base_train_samples)
+    test_count = len(base_val_samples)
+    print(f"{test_count=}")
+    print(f"{train_count=}")
+    train_annotations = sum(len(s["shapes"]) for s in base_train_samples)
+    test_annotations = sum(len(s["shapes"]) for s in base_val_samples)
 
     project_root = _ensure_dir(helper.MEDIA_PROJECT_ROOT / str(project.id))
     dataset_root = _ensure_dir(project_root / "datasets")
@@ -484,8 +490,8 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
 
     return {
         "label_file": str(det_info["train_label"]),
-        "samples": len(train_samples) + len(val_samples),
-        "annotations": sum(len(s["shapes"]) for s in train_samples + val_samples),
+        "samples": train_count + test_count,
+        "annotations": train_annotations + test_annotations,
         "dataset_dir": str(dataset_root),
         "images_dir": str(images_root),
         "images": len(samples),
@@ -497,6 +503,10 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
             reverse=True,
         ),
         "category_total": len(category_counts),
+        "train_samples": train_count,
+        "test_samples": test_count,
+        "train_annotations": train_annotations,
+        "test_annotations": test_annotations,
         "det": det_info,
         "rec": rec_info,
         "kie": kie_info,
