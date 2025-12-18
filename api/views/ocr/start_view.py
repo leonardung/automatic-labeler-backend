@@ -2,74 +2,84 @@ import json
 import logging
 import os
 import random
-import re
-import shutil
 import subprocess
 import sys
 import threading
 import uuid
-from collections import deque
-from dataclasses import dataclass, field
-from datetime import datetime
 from itertools import product
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
-import yaml
 from django.conf import settings
-from django.http import FileResponse, JsonResponse
-from django.db.models import Count
+from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.views import APIView
 from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from api.models.image import ImageModel
-from api.models.ocr import OcrAnnotation
 from api.models.project import Project
+
+from . import helper
 
 log = logging.getLogger(__name__)
 
-# Default config locations provided by the user.
-DET_CONFIG_PATH = (
-    Path(settings.BASE_DIR)
-    / "submodules"
-    / "PaddleOCR"
-    / "configs"
-    / "det"
-    / "PP-OCRv5"
-    / "PP-OCRv5_server_det.yml"
-)
-REC_CONFIG_PATH = (
-    Path(settings.BASE_DIR)
-    / "submodules"
-    / "PaddleOCR"
-    / "configs"
-    / "rec"
-    / "PP-OCRv5"
-    / "multi_language"
-    / "latin_PP-OCRv5_mobile_rec.yml"
-)
-KIE_CONFIG_PATH = (
-    Path(settings.BASE_DIR)
-    / "submodules"
-    / "PaddleOCR"
-    / "configs"
-    / "kie"
-    / "vi_layoutxlm"
-    / "ser_vi_layoutxlm_xfund_zh.yml"
-)
 
-PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
-MEDIA_PROJECT_ROOT = Path(settings.MEDIA_ROOT) / "projects"
-PRETRAIN_ROOT = Path(settings.MEDIA_ROOT) / "pretrain_models"
-LOG_PATH_ROOT = str(Path(settings.BASE_DIR).resolve())
+class TrainingCancelled(Exception):
+    """Raised when a training run is intentionally stopped by the user."""
 
-# Shared in-memory state for coordinating training runs.
-TRAINING_JOBS: Dict[str, "TrainingJob"] = {}
-TRAINING_QUEUE: deque[str] = deque()
-TRAINING_LOCK = threading.Lock()
-CURRENT_JOB_ID: Optional[str] = None
+
+class OcrTrainingStartView(APIView):
+    permission_classes = [IsAuthenticated]
+    authentication_classes = [JWTAuthentication]
+
+    def post(self, request):
+        payload = request.data or {}
+        project_id = payload.get("project_id")
+        models_requested = payload.get("models") or []
+        config = payload.get("config") or {}
+
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return JsonResponse(
+                {"error": "Project not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+
+        if project.type not in ("ocr", "ocr_kie"):
+            return JsonResponse(
+                {"error": "Training only supported for OCR / OCR KIE projects."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        valid_targets = [m for m in models_requested if m in ("det", "rec", "kie")]
+        if not valid_targets:
+            return JsonResponse(
+                {"error": "No valid models specified."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        job_id = uuid.uuid4().hex
+        job_log_dir = _ensure_dir(Path(settings.MEDIA_ROOT) / "logs" / "training")
+        job = helper.TrainingJob(
+            id=job_id,
+            user_id=request.user.id,
+            project_id=project.id,
+            targets=valid_targets,
+            log_path=job_log_dir / f"{job_id}.log",
+        )
+        helper.TRAINING_JOBS[job_id] = job
+        job.config_used = {
+            "global": _extract_global_cfg(config),
+            "models": config.get("models") or {},
+        }
+
+        _enqueue_job(job, config)
+
+        return JsonResponse(
+            {"job": helper._serialize_job(job)}, status=status.HTTP_202_ACCEPTED
+        )
 
 
 def _ensure_dir(path: Path):
@@ -88,49 +98,6 @@ def _clean_text(text: str) -> str:
     if text is None:
         return ""
     return str(text).replace("\t", " ").replace("\n", " ").strip()
-
-
-def _sanitize_log_line(line: str) -> str:
-    if not line:
-        return line
-    return line.replace(LOG_PATH_ROOT, "...")
-
-
-def _parse_epoch_progress(log_lines: List[str]) -> Optional[dict]:
-    """
-    Find the most recent epoch progress marker in the log tail.
-    Expected pattern: "epoch: [2/50]" (case-insensitive).
-    """
-    pattern = re.compile(r"epoch:\s*\[(\d+)\s*/\s*(\d+)\]", re.IGNORECASE)
-    for line in reversed(log_lines or []):
-        match = pattern.search(line)
-        if match:
-            try:
-                current = int(match.group(1))
-                total = int(match.group(2))
-                return {
-                    "current": current,
-                    "total": total,
-                }
-            except Exception:
-                continue
-    return None
-
-
-def _expand_samples(split_samples: List[Any], target: int) -> List[Any]:
-    """
-    Duplicate items until we reach target count. Keeps original order and cycles.
-    """
-    if not split_samples:
-        return []
-    if len(split_samples) >= target:
-        return split_samples
-    output = list(split_samples)
-    idx = 0
-    while len(output) < target:
-        output.append(split_samples[idx % len(split_samples)])
-        idx += 1
-    return output
 
 
 def _bbox_from_points(points: Iterable[dict]):
@@ -162,29 +129,20 @@ def sort_annotations(
     return sorted(annotations, key=_key, reverse=reverse)
 
 
-def _dataset_snapshot(project: Project) -> dict:
+def _expand_samples(split_samples: List[Any], target: int) -> List[Any]:
     """
-    Summarize dataset stats without writing any files.
+    Duplicate items until we reach target count. Keeps original order and cycles.
     """
-    total_images = ImageModel.objects.filter(project=project).count()
-    annotated = OcrAnnotation.objects.filter(image__project=project)
-    images_with_labels = annotated.values("image_id").distinct().count()
-    category_rows = annotated.values("category").annotate(total=Count("id"))
-    category_counts: List[dict] = []
-    total_boxes = 0
-    for row in category_rows:
-        label = row.get("category") or "Unlabeled"
-        count = int(row.get("total") or 0)
-        total_boxes += count
-        category_counts.append({"label": label, "count": count})
-    category_counts.sort(key=lambda item: item["count"], reverse=True)
-    return {
-        "images": images_with_labels,
-        "total_images": total_images,
-        "boxes": total_boxes,
-        "categories": category_counts,
-        "category_total": len(category_counts),
-    }
+    if not split_samples:
+        return []
+    if len(split_samples) >= target:
+        return split_samples
+    output = list(split_samples)
+    idx = 0
+    while len(output) < target:
+        output.append(split_samples[idx % len(split_samples)])
+        idx += 1
+    return output
 
 
 def token_len(text: str, tokenizer) -> int:
@@ -316,22 +274,6 @@ def _augment_file_per_grid(
                 fout.write(f"{img_path}\t{json.dumps(new_anns, ensure_ascii=False)}\n")
 
 
-def _load_model_defaults(config_path: Path) -> dict:
-    if not config_path.exists():
-        return {}
-    try:
-        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log.warning("Failed to parse %s: %s", config_path, exc)
-        return {}
-    global_cfg = data.get("Global", {}) or {}
-    return {
-        "epoch_num": global_cfg.get("epoch_num"),
-        "print_batch_step": global_cfg.get("print_batch_step"),
-        "eval_batch_step": global_cfg.get("eval_batch_step"),
-    }
-
-
 def _extract_global_cfg(config: Optional[dict]) -> dict:
     config = config or {}
     explicit_global = config.get("global") or {}
@@ -345,116 +287,25 @@ def _extract_global_cfg(config: Optional[dict]) -> dict:
     }
 
 
-def _check_stop(job: "TrainingJob"):
+def _check_stop(job: helper.TrainingJob):
     if job.stop_requested:
         raise TrainingCancelled()
 
 
-def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
-    logs_content = ""
-    if include_logs and job.log_path and job.log_path.exists():
-        try:
-            logs_content = _sanitize_log_line(job.log_path.read_text(encoding="utf-8"))
-        except Exception:
-            logs_content = ""
-    progress_info = _parse_epoch_progress(job.log_tail)
-    progress_percent = None
-    progress_label = None
-    if progress_info:
-        current = progress_info.get("current") or 0
-        total = progress_info.get("total") or 0
-        if total > 0:
-            progress_percent = min(100, max(0, int(current * 100 / total)))
-            progress_label = f"Epoch {current}/{total}"
-        else:
-            progress_label = f"Epoch {current}"
-    with TRAINING_LOCK:
-        queue_position: Optional[int] = None
-        if job.status == "waiting":
-            try:
-                queue_position = list(TRAINING_QUEUE).index(job.id) + 1
-            except ValueError:
-                queue_position = None
-        elif CURRENT_JOB_ID == job.id:
-            queue_position = 0
-    return {
-        "id": job.id,
-        "status": job.status,
-        "message": job.message,
-        "error": job.error,
-        "targets": job.targets,
-        "queue_position": queue_position,
-        "started_at": job.started_at.isoformat() if job.started_at else None,
-        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
-        "created_at": job.created_at.isoformat() if job.created_at else None,
-        "dataset": job.dataset_info or {},
-        "config": job.config_used,
-        "log_available": bool(job.log_path and job.log_path.exists()),
-        "logs": logs_content if include_logs else None,
-        "progress": {
-            "current": progress_info.get("current") if progress_info else None,
-            "total": progress_info.get("total") if progress_info else None,
-            "percent": progress_percent,
-            "label": progress_label,
-        },
-    }
-
-
-@dataclass
-class TrainingJob:
-    id: str
-    user_id: int
-    project_id: int
-    targets: List[str]
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    status: str = "pending"
-    message: str = ""
-    error: Optional[str] = None
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    dataset_info: Optional[dict] = None
-    config_used: Optional[dict] = None
-    log_tail: List[str] = field(default_factory=list)
-    log_path: Optional[Path] = None
-    config_raw: dict = field(default_factory=dict)
-    stop_requested: bool = False
-    thread: Optional[threading.Thread] = field(default=None, repr=False)
-    current_process: Optional[subprocess.Popen] = field(default=None, repr=False)
-
-    def append_log(self, line: str, persist: bool = True):
-        if line:
-            clean_line = _sanitize_log_line(line)
-            self.log_tail.append(clean_line.rstrip())
-            self.log_tail = self.log_tail[-40:]
-            self.message = "\n".join(self.log_tail[-10:])
-        if persist and self.log_path:
-            with self.log_path.open("a", encoding="utf-8") as fp:
-                fp.write(_sanitize_log_line(line))
-
-
-class TrainingCancelled(Exception):
-    """Raised when a training run is intentionally stopped by the user."""
-
-
-def _finish_job(job: "TrainingJob", status_value: str, error: Optional[str] = None):
-    job.status = status_value
-    job.error = error
-    job.finished_at = datetime.utcnow()
-
-
 def _start_next_job_locked():
-    global CURRENT_JOB_ID
-    if CURRENT_JOB_ID is not None or not TRAINING_QUEUE:
+    if helper.CURRENT_JOB_ID is not None or not helper.TRAINING_QUEUE:
         return
-    while TRAINING_QUEUE:
-        next_job_id = TRAINING_QUEUE.popleft()
-        job = TRAINING_JOBS.get(next_job_id)
+    while helper.TRAINING_QUEUE:
+        next_job_id = helper.TRAINING_QUEUE.popleft()
+        job = helper.TRAINING_JOBS.get(next_job_id)
         if not job:
             continue
         if job.stop_requested:
-            _finish_job(job, "stopped", error=job.error or "Stopped before start.")
+            helper._finish_job(
+                job, "stopped", error=job.error or "Stopped before start."
+            )
             continue
-        CURRENT_JOB_ID = job.id
+        helper.CURRENT_JOB_ID = job.id
         job.status = "running"
         job.started_at = datetime.utcnow()
         job.thread = threading.Thread(
@@ -464,236 +315,28 @@ def _start_next_job_locked():
         break
 
 
-def _enqueue_job(job: "TrainingJob", config: dict):
+def _enqueue_job(job: helper.TrainingJob, config: dict):
     job.config_raw = config or {}
     job.status = "waiting"
     job.append_log("Queued for training.\n")
-    with TRAINING_LOCK:
-        TRAINING_QUEUE.append(job.id)
+    with helper.TRAINING_LOCK:
+        helper.TRAINING_QUEUE.append(job.id)
         _start_next_job_locked()
 
 
 def _release_and_start_next(job_id: str):
-    with TRAINING_LOCK:
-        global CURRENT_JOB_ID
-        if CURRENT_JOB_ID == job_id:
-            CURRENT_JOB_ID = None
+    with helper.TRAINING_LOCK:
+        if helper.CURRENT_JOB_ID == job_id:
+            helper.CURRENT_JOB_ID = None
         _start_next_job_locked()
 
 
-def _stop_job(job: "TrainingJob"):
-    if job.status in ("completed", "failed", "stopped"):
-        return
-    job.stop_requested = True
-    job.append_log("Stop requested by user.\n")
-    with TRAINING_LOCK:
-        if job.status == "waiting":
-            try:
-                TRAINING_QUEUE.remove(job.id)
-            except ValueError:
-                pass
-            _finish_job(job, "stopped", error="Stopped by user.")
-            return
-    if job.status == "running" and job.current_process:
-        proc = job.current_process
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
-class OcrTrainingDefaultsView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get(self, request):
-        defaults = {
-            "use_gpu": True,
-            "test_ratio": 0.3,
-            "train_seed": 42,
-            "split_seed": 42,
-            "paths": {
-                "config_path": str(DET_CONFIG_PATH),
-                "dataset_root": str(MEDIA_PROJECT_ROOT),
-                "media_root": str(settings.MEDIA_ROOT),
-                "images_folder": "images",
-                "dataset_folder": "datasets",
-                "paddle_ocr_path": str(PADDLE_ROOT),
-                "pretrain_root": str(PRETRAIN_ROOT),
-            },
-            "models": {
-                "det": {
-                    "epoch_num": 50,
-                    "print_batch_step": 10,
-                    "eval_batch_step": 200,
-                },
-                "rec": {
-                    "epoch_num": 50,
-                    "print_batch_step": 10,
-                    "eval_batch_step": 200,
-                },
-                "kie": {
-                    "epoch_num": 50,
-                    "print_batch_step": 10,
-                    "eval_batch_step": 200,
-                },
-            },
-        }
-        return JsonResponse({"defaults": defaults}, status=status.HTTP_200_OK)
-
-
-class OcrTrainingDatasetView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get(self, request):
-        project_id = request.query_params.get("project_id")
-        if not project_id:
-            return JsonResponse(
-                {"error": "project_id is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        try:
-            project = Project.objects.get(id=project_id, user=request.user)
-        except Project.DoesNotExist:
-            return JsonResponse(
-                {"error": "Project not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        try:
-            dataset = _dataset_snapshot(project)
-        except Exception as exc:
-            log.exception("Failed to collect dataset snapshot: %s", exc)
-            return JsonResponse(
-                {"error": "Unable to load dataset summary."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
-        return JsonResponse({"dataset": dataset}, status=status.HTTP_200_OK)
-
-
-class OcrTrainingJobView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get(self, request, job_id: str):
-        job = TRAINING_JOBS.get(job_id)
-        if not job or job.user_id != request.user.id:
-            return JsonResponse(
-                {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-        return JsonResponse(
-            {"job": _serialize_job(job, include_logs=True)},
-            status=status.HTTP_200_OK,
-        )
-
-
-class OcrTrainingJobListView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get(self, request):
-        jobs = [job for job in TRAINING_JOBS.values() if job.user_id == request.user.id]
-        jobs_sorted = sorted(jobs, key=lambda j: j.created_at, reverse=True)
-        return JsonResponse(
-            {"jobs": [_serialize_job(job) for job in jobs_sorted]},
-            status=status.HTTP_200_OK,
-        )
-
-
-class OcrTrainingJobStopView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def post(self, request, job_id: str):
-        job = TRAINING_JOBS.get(job_id)
-        if not job or job.user_id != request.user.id:
-            return JsonResponse(
-                {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-        _stop_job(job)
-        return JsonResponse({"job": _serialize_job(job)}, status=status.HTTP_200_OK)
-
-
-class OcrTrainingJobLogsView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def get(self, request, job_id: str):
-        job = TRAINING_JOBS.get(job_id)
-        if not job or job.user_id != request.user.id:
-            return JsonResponse(
-                {"error": "Job not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-        if not job.log_path or not job.log_path.exists():
-            return JsonResponse(
-                {"error": "Log not found for this job."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-        return FileResponse(
-            job.log_path.open("rb"), as_attachment=True, filename=f"{job.id}.log"
-        )
-
-
-class OcrTrainingStartView(APIView):
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [JWTAuthentication]
-
-    def post(self, request):
-        payload = request.data or {}
-        project_id = payload.get("project_id")
-        models_requested = payload.get("models") or []
-        config = payload.get("config") or {}
-
-        try:
-            project = Project.objects.get(id=project_id, user=request.user)
-        except Project.DoesNotExist:
-            return JsonResponse(
-                {"error": "Project not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-
-        if project.type not in ("ocr", "ocr_kie"):
-            return JsonResponse(
-                {"error": "Training only supported for OCR / OCR KIE projects."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        valid_targets = [m for m in models_requested if m in ("det", "rec", "kie")]
-        if not valid_targets:
-            return JsonResponse(
-                {"error": "No valid models specified."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        job_id = uuid.uuid4().hex
-        job_log_dir = _ensure_dir(Path(settings.MEDIA_ROOT) / "logs" / "training")
-        job = TrainingJob(
-            id=job_id,
-            user_id=request.user.id,
-            project_id=project.id,
-            targets=valid_targets,
-            log_path=job_log_dir / f"{job_id}.log",
-        )
-        TRAINING_JOBS[job_id] = job
-        job.config_used = {
-            "global": _extract_global_cfg(config),
-            "models": config.get("models") or {},
-        }
-
-        _enqueue_job(job, config)
-
-        return JsonResponse(
-            {"job": _serialize_job(job)}, status=status.HTTP_202_ACCEPTED
-        )
-
-
-def _run_training(job: TrainingJob):
+def _run_training(job: helper.TrainingJob):
     try:
         try:
             project = Project.objects.get(id=job.project_id, user_id=job.user_id)
         except Project.DoesNotExist:
-            _finish_job(job, "failed", error="Project not found for this job.")
+            helper._finish_job(job, "failed", error="Project not found for this job.")
             return
 
         config = job.config_raw or {}
@@ -715,12 +358,14 @@ def _run_training(job: TrainingJob):
                 f"Prepared datasets at {dataset_info.get('dataset_dir', '')}\n"
             )
         except TrainingCancelled:
-            _finish_job(job, "stopped", error="Stopped by user.")
+            helper._finish_job(job, "stopped", error="Stopped by user.")
             job.append_log("Training stopped.\n")
             return
         except Exception as exc:
             log.exception("Failed to prepare datasets: %s", exc)
-            _finish_job(job, "failed", error=f"Dataset preparation failed: {exc}")
+            helper._finish_job(
+                job, "failed", error=f"Dataset preparation failed: {exc}"
+            )
             return
 
         success = True
@@ -730,7 +375,7 @@ def _run_training(job: TrainingJob):
                 _train_model(target, project, dataset_info, global_cfg, overrides, job)
             except TrainingCancelled:
                 success = False
-                _finish_job(job, "stopped", error="Stopped by user.")
+                helper._finish_job(job, "stopped", error="Stopped by user.")
                 job.append_log("Training stopped.\n")
                 break
             except Exception as exc:
@@ -738,17 +383,17 @@ def _run_training(job: TrainingJob):
                 job.append_log(f"[{target}] failed: {exc}\n")
                 job.error = str(exc)
                 success = False
-                _finish_job(job, "failed", error=str(exc))
+                helper._finish_job(job, "failed", error=str(exc))
                 break
 
         if success:
             job.append_log("Training completed.\n")
-            _finish_job(job, "completed")
+            helper._finish_job(job, "completed")
     finally:
         job.current_process = None
 
 
-def _run_training_wrapper(job: TrainingJob):
+def _run_training_wrapper(job: helper.TrainingJob):
     try:
         _run_training(job)
     finally:
@@ -821,7 +466,7 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     train_samples = _expand_samples(base_train_samples, train_target)
     val_samples = _expand_samples(base_val_samples, val_target)
 
-    project_root = _ensure_dir(MEDIA_PROJECT_ROOT / str(project.id))
+    project_root = _ensure_dir(helper.MEDIA_PROJECT_ROOT / str(project.id))
     dataset_root = _ensure_dir(project_root / "datasets")
 
     det_info = _write_detection_dataset(dataset_root, train_samples, val_samples)
@@ -1068,13 +713,13 @@ def _train_model(
     dataset_info: dict,
     global_cfg: dict,
     overrides: dict,
-    job: TrainingJob,
+    job: helper.TrainingJob,
 ):
     _check_stop(job)
     cfg_path = {
-        "det": DET_CONFIG_PATH,
-        "rec": REC_CONFIG_PATH,
-        "kie": KIE_CONFIG_PATH,
+        "det": helper.DET_CONFIG_PATH,
+        "rec": helper.REC_CONFIG_PATH,
+        "kie": helper.KIE_CONFIG_PATH,
     }[target]
     if not cfg_path.exists():
         raise RuntimeError(f"Missing config for {target}: {cfg_path}")
@@ -1083,7 +728,9 @@ def _train_model(
     if not global_cfg.get("use_gpu", True):
         paddle_env["CUDA_VISIBLE_DEVICES"] = ""
 
-    models_dir = _ensure_dir(MEDIA_PROJECT_ROOT / str(project.id) / "models" / target)
+    models_dir = _ensure_dir(
+        helper.MEDIA_PROJECT_ROOT / str(project.id) / "models" / target
+    )
 
     cmd = [
         str(Path(sys.executable if "sys" in globals() else "python")),
@@ -1097,7 +744,7 @@ def _train_model(
         det = dataset_info["det"]
         overrides_list.extend(
             [
-                f"Global.pretrained_model={PRETRAIN_ROOT / 'PP-OCRv5_server_det_pretrained.pdparams'}",
+                f"Global.pretrained_model={helper.PRETRAIN_ROOT / 'PP-OCRv5_server_det_pretrained.pdparams'}",
                 f"Global.save_model_dir={models_dir}",
                 f"Train.dataset.data_dir={det['data_dir']}",
                 f"Train.dataset.label_file_list=['{det['train_label']}']",
@@ -1109,8 +756,8 @@ def _train_model(
         rec = dataset_info["rec"]
         overrides_list.extend(
             [
-                f"Global.pretrained_model={PRETRAIN_ROOT / 'latin_PP-OCRv5_mobile_rec_pretrained.pdparams'}",
-                f"Global.character_dict_path={PADDLE_ROOT / 'ppocr' / 'utils' / 'dict' / 'ppocrv5_latin_dict.txt'}",
+                f"Global.pretrained_model={helper.PRETRAIN_ROOT / 'latin_PP-OCRv5_mobile_rec_pretrained.pdparams'}",
+                f"Global.character_dict_path={helper.PADDLE_ROOT / 'ppocr' / 'utils' / 'dict' / 'ppocrv5_latin_dict.txt'}",
                 f"Global.save_model_dir={models_dir}",
                 f"Train.dataset.data_dir={rec['data_dir']}",
                 f"Train.dataset.label_file_list=['{rec['train_label']}']",
@@ -1132,7 +779,9 @@ def _train_model(
         val_label_path = Path(kie["val_label"]).as_posix()
         kie_model_cfg = {
             "class_path": class_path,
-            "pretrained_model": (PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh").as_posix(),
+            "pretrained_model": (
+                helper.PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh"
+            ).as_posix(),
             "dataset_train": f'["{train_label_path}"]',
             "dataset_val": f'["{val_label_path}"]',
         }
@@ -1171,7 +820,7 @@ def _train_model(
 
     process = subprocess.Popen(
         cmd,
-        cwd=PADDLE_ROOT,
+        cwd=helper.PADDLE_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
