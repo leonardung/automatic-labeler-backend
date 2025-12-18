@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,27 @@ def _sanitize_log_line(line: str) -> str:
     if not line:
         return line
     return line.replace(LOG_PATH_ROOT, "...")
+
+
+def _parse_epoch_progress(log_lines: List[str]) -> Optional[dict]:
+    """
+    Find the most recent epoch progress marker in the log tail.
+    Expected pattern: "epoch: [2/50]" (case-insensitive).
+    """
+    pattern = re.compile(r"epoch:\s*\[(\d+)\s*/\s*(\d+)\]", re.IGNORECASE)
+    for line in reversed(log_lines or []):
+        match = pattern.search(line)
+        if match:
+            try:
+                current = int(match.group(1))
+                total = int(match.group(2))
+                return {
+                    "current": current,
+                    "total": total,
+                }
+            except Exception:
+                continue
+    return None
 
 
 def _expand_samples(split_samples: List[Any], target: int) -> List[Any]:
@@ -336,6 +358,17 @@ def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
             logs_content = _sanitize_log_line(job.log_path.read_text(encoding="utf-8"))
         except Exception:
             logs_content = ""
+    progress_info = _parse_epoch_progress(job.log_tail)
+    progress_percent = None
+    progress_label = None
+    if progress_info:
+        current = progress_info.get("current") or 0
+        total = progress_info.get("total") or 0
+        if total > 0:
+            progress_percent = min(100, max(0, int(current * 100 / total)))
+            progress_label = f"Epoch {current}/{total}"
+        else:
+            progress_label = f"Epoch {current}"
     with TRAINING_LOCK:
         queue_position: Optional[int] = None
         if job.status == "waiting":
@@ -359,6 +392,12 @@ def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
         "config": job.config_used,
         "log_available": bool(job.log_path and job.log_path.exists()),
         "logs": logs_content if include_logs else None,
+        "progress": {
+            "current": progress_info.get("current") if progress_info else None,
+            "total": progress_info.get("total") if progress_info else None,
+            "percent": progress_percent,
+            "label": progress_label,
+        },
     }
 
 
