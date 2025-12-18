@@ -328,7 +328,6 @@ def _load_model_defaults(config_path: Path) -> dict:
     return {
         "epoch_num": global_cfg.get("epoch_num"),
         "print_batch_step": global_cfg.get("print_batch_step"),
-        "save_epoch_step": global_cfg.get("save_epoch_step"),
         "eval_batch_step": global_cfg.get("eval_batch_step"),
     }
 
@@ -528,19 +527,16 @@ class OcrTrainingDefaultsView(APIView):
                 "det": {
                     "epoch_num": 50,
                     "print_batch_step": 10,
-                    "save_epoch_step": 1e111,
                     "eval_batch_step": 200,
                 },
                 "rec": {
                     "epoch_num": 50,
                     "print_batch_step": 10,
-                    "save_epoch_step": 1e111,
                     "eval_batch_step": 200,
                 },
                 "kie": {
                     "epoch_num": 50,
                     "print_batch_step": 10,
-                    "save_epoch_step": 1e111,
                     "eval_batch_step": 200,
                 },
             },
@@ -1160,6 +1156,7 @@ def _train_model(
         )
 
     model_overrides = overrides.get(target) or {}
+    model_overrides = {**model_overrides, "save_epoch_step": 100000000}
     for key, value in model_overrides.items():
         overrides_list.append(f"Global.{key}={value}")
 
