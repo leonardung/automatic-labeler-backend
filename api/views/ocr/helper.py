@@ -83,7 +83,6 @@ class TrainingJob:
     targets: List[str]
     created_at: datetime = field(default_factory=datetime.utcnow)
     status: str = "pending"
-    message: str = ""
     error: Optional[str] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
@@ -101,7 +100,6 @@ class TrainingJob:
             clean_line = _sanitize_log_line(line)
             self.log_tail.append(clean_line.rstrip())
             self.log_tail = self.log_tail[-40:]
-            self.message = "\n".join(self.log_tail[-10:])
         if persist and self.log_path:
             with self.log_path.open("a", encoding="utf-8") as fp:
                 fp.write(_sanitize_log_line(line))
@@ -111,6 +109,46 @@ def _finish_job(job: "TrainingJob", status_value: str, error: Optional[str] = No
     job.status = status_value
     job.error = error
     job.finished_at = datetime.utcnow()
+
+
+def _public_dataset_info(dataset: Optional[dict]) -> dict:
+    """
+    Strip path-heavy fields from dataset metadata before returning to clients.
+    """
+    if not dataset:
+        return {}
+    allowed_keys = {
+        "samples",
+        "annotations",
+        "images",
+        "total_images",
+        "boxes",
+        "categories",
+        "category_total",
+    }
+    public = {key: dataset.get(key) for key in allowed_keys if key in dataset}
+    categories = dataset.get("categories")
+    if categories:
+        public["categories"] = [
+            {"label": cat.get("label"), "count": cat.get("count")}
+            for cat in categories
+            if isinstance(cat, dict)
+        ]
+    return public
+
+
+def _public_config(config: Optional[dict]) -> Optional[dict]:
+    """
+    Remove path-like fields from config metadata sent to clients.
+    """
+    if not config:
+        return config
+    global_cfg = dict(config.get("global") or {})
+    global_cfg.pop("images_folder", None)
+    return {
+        "global": global_cfg,
+        "models": config.get("models") or {},
+    }
 
 
 def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
@@ -143,15 +181,14 @@ def _serialize_job(job: "TrainingJob", include_logs: bool = False) -> dict:
     return {
         "id": job.id,
         "status": job.status,
-        "message": job.message,
         "error": job.error,
         "targets": job.targets,
         "queue_position": queue_position,
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
         "created_at": job.created_at.isoformat() if job.created_at else None,
-        "dataset": job.dataset_info or {},
-        "config": job.config_used,
+        "dataset": _public_dataset_info(job.dataset_info),
+        "config": _public_config(job.config_used),
         "log_available": bool(job.log_path and job.log_path.exists()),
         "logs": logs_content if include_logs else None,
         "progress": {

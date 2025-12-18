@@ -18,15 +18,6 @@ class OcrTrainingDefaultsView(APIView):
             "test_ratio": 0.3,
             "train_seed": 42,
             "split_seed": 42,
-            "paths": {
-                "config_path": str(helper.DET_CONFIG_PATH),
-                "dataset_root": str(helper.MEDIA_PROJECT_ROOT),
-                "media_root": str(settings.MEDIA_ROOT),
-                "images_folder": "images",
-                "dataset_folder": "datasets",
-                "paddle_ocr_path": str(helper.PADDLE_ROOT),
-                "pretrain_root": str(helper.PRETRAIN_ROOT),
-            },
             "models": {
                 "det": {
                     "epoch_num": 50,
