@@ -20,6 +20,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from api.models.image import ImageModel
 from api.models.project import Project
+from api.models.training import TrainingConfig
 
 from . import helper
 
@@ -38,7 +39,7 @@ class OcrTrainingStartView(APIView):
         payload = request.data or {}
         project_id = payload.get("project_id")
         models_requested = payload.get("models") or []
-        config = payload.get("config") or {}
+        config = _normalize_training_config(payload.get("config") or {})
 
         try:
             project = Project.objects.get(id=project_id, user=request.user)
@@ -75,6 +76,7 @@ class OcrTrainingStartView(APIView):
             "models": config.get("models") or {},
         }
 
+        _persist_training_config(request.user, project, config)
         _enqueue_job(job, config)
 
         return JsonResponse(
@@ -98,6 +100,34 @@ def _clean_text(text: str) -> str:
     if text is None:
         return ""
     return str(text).replace("\t", " ").replace("\n", " ").strip()
+
+
+def _normalize_training_config(config: Optional[dict]) -> dict:
+    """
+    Flatten the training config payload so that global keys live at the top level.
+    """
+    config = config or {}
+    normalized = dict(config)
+    global_cfg = config.get("global") or {}
+    normalized.pop("global", None)
+    for key, value in global_cfg.items():
+        normalized.setdefault(key, value)
+    models_cfg = normalized.get("models") or config.get("models") or {}
+    if not isinstance(models_cfg, dict):
+        models_cfg = {}
+    normalized["models"] = models_cfg
+    return normalized
+
+
+def _persist_training_config(user, project: Project, config: dict):
+    try:
+        TrainingConfig.objects.update_or_create(
+            user=user, project=project, defaults={"config": config or {}}
+        )
+    except Exception as exc:
+        log.exception(
+            "Failed to persist training config for project %s: %s", project.id, exc
+        )
 
 
 def _bbox_from_points(points: Iterable[dict]):
