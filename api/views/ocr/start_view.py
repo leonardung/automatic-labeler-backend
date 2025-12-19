@@ -632,7 +632,7 @@ def _write_kie_dataset(
     kie_root = _ensure_dir(dataset_root / "kie" / "train_data")
     class_list_path = kie_root / "class_list.txt"
     # Always include a catch-all class so empty/missing labels map safely.
-    categories = {"others"}
+    categories = {"None"}
     for sample in train_samples + val_samples:
         for shape in sample["shapes"]:
             if shape["category"]:
@@ -675,7 +675,7 @@ def _write_kie_dataset(
                 ]
         if len(pts) < 4:
             return None
-        category = shape.get("category") or "others"
+        category = shape.get("category") or "None"
         return {
             "transcription": _clean_text(shape.get("text", "")),
             "points": pts,
@@ -743,7 +743,7 @@ def _write_kie_dataset(
         "train_label": str(train_txt),
         "val_label": str(val_txt),
         "class_path": str(class_list_path),
-        "num_classes": len(categories) - 1,
+        "num_classes": len(categories),
     }
 
 
@@ -820,7 +820,7 @@ def _train_model(
         kie_model_cfg = {
             "class_path": class_path,
             "pretrained_model": (
-                helper.PRETRAIN_ROOT / "ser_LayoutXLM_xfun_zh"
+                helper.PRETRAIN_ROOT / "ser_vi_layoutxlm_xfund_pretrained/best_accuracy"
             ).as_posix(),
             "dataset_train": f'["{train_label_path}"]',
             "dataset_val": f'["{val_label_path}"]',
@@ -841,6 +841,7 @@ def _train_model(
                 f"Eval.dataset.data_dir={images_folder}",
                 f"Eval.dataset.label_file_list={kie_model_cfg['dataset_val']}",
                 "Eval.dataset.ratio_list=1",
+                "Eval.loader.batch_size_per_card=1",
             ]
         )
 
