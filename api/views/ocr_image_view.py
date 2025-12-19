@@ -1,5 +1,6 @@
 import inspect
 import logging
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -12,7 +13,9 @@ from rest_framework.response import Response
 
 from api.models.image import ImageModel
 from api.models.ocr import OcrAnnotation
+from api.models.project import Project
 from api.serializers import ImageModelSerializer
+from api.views.ocr import helper as ocr_helper
 from .base_image_view import BaseImageViewSet
 
 
@@ -35,6 +38,103 @@ _DETECTOR_CACHE: dict[str, TextDetection] = {}
 _RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
 ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
 ACTIVE_REC_MODEL_NAME = DEFAULT_REC_MODEL_NAME
+_TRAINED_INFERENCE_SUBDIR = "inference"
+_TRAINED_MODEL_KEY = "trained-project-{project_id}-{target}"
+
+
+def _trained_model_dir(project_id: int | str, target: str) -> Path:
+    return ocr_helper.MEDIA_PROJECT_ROOT / str(project_id) / "models" / target
+
+
+def _find_checkpoint_prefix(models_dir: Path) -> Path:
+    """
+    Return the checkpoint prefix (without extension) for the best available weights.
+    Preference order: best_accuracy, best_model/model, latest, any *.pdparams.
+    """
+    candidates = [
+        models_dir / "best_accuracy",
+        models_dir / "best_model" / "model",
+        models_dir / "latest",
+        models_dir / "latest" / "model",
+        models_dir / "latest" / "model_state",
+    ]
+    for prefix in candidates:
+        if prefix.with_suffix(".pdparams").exists():
+            return prefix
+
+    pdparams_files = sorted(models_dir.rglob("*.pdparams"))
+    if not pdparams_files:
+        raise FileNotFoundError(f"No checkpoint files found in {models_dir}")
+    return pdparams_files[0].with_suffix("")
+
+
+def _has_inference_files(inference_dir: Path) -> bool:
+    if not inference_dir.is_dir():
+        return False
+    has_model_file = any(inference_dir.glob("*.pdmodel")) or any(
+        inference_dir.glob("*.json")
+    )
+    has_params = any(inference_dir.glob("*.pdiparams"))
+    return has_model_file and has_params
+
+
+def _export_trained_model(project_id: int | str, target: str) -> tuple[Path, Path]:
+    """
+    Export a trained PaddleOCR model to inference format.
+
+    Returns (inference_dir, checkpoint_prefix).
+    """
+    models_dir = _trained_model_dir(project_id, target)
+    if not models_dir.exists():
+        raise FileNotFoundError(
+            f"No trained {target} model directory found for project {project_id}."
+        )
+
+    config_path = models_dir / "config.yml"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"Config file not found for trained {target} model at {config_path}."
+        )
+
+    checkpoint_prefix = _find_checkpoint_prefix(models_dir)
+    inference_dir = models_dir / _TRAINED_INFERENCE_SUBDIR
+    checkpoint_path = checkpoint_prefix.with_suffix(".pdparams")
+
+    needs_export = True
+    if _has_inference_files(inference_dir) and checkpoint_path.exists():
+        try:
+            checkpoint_mtime = checkpoint_path.stat().st_mtime
+            infer_mtime = max(p.stat().st_mtime for p in inference_dir.glob("*.pd*"))
+            needs_export = checkpoint_mtime > infer_mtime
+        except ValueError:
+            needs_export = True
+
+    if not needs_export:
+        return inference_dir, checkpoint_prefix
+
+    cmd = [
+        sys.executable,
+        "tools/export_model.py",
+        "-c",
+        str(config_path),
+        "-o",
+        f"Global.checkpoints={checkpoint_prefix.as_posix()}",
+        f"Global.save_inference_dir={inference_dir.as_posix()}",
+    ]
+    process = subprocess.run(
+        cmd,
+        cwd=ocr_helper.PADDLE_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if process.returncode != 0:
+        err_output = process.stderr or process.stdout
+        raise RuntimeError(
+            f"Failed to export {target} model for project {project_id}: {err_output}"
+        )
+
+    return inference_dir, checkpoint_prefix
 
 
 class OcrImageViewSet(BaseImageViewSet):
@@ -401,6 +501,107 @@ class OcrImageViewSet(BaseImageViewSet):
         if min_x == max_x or min_y == max_y:
             return None
         return (min_x, min_y, max_x, max_y)
+
+    @action(detail=False, methods=["post"])
+    def configure_trained_models(self, request):
+        """
+        Export and load finetuned OCR models for a project, then set them active.
+        """
+        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME
+
+        if TextDetection is None or TextRecognition is None:
+            return Response(
+                {"error": "PaddleOCR modules unavailable. Is the submodule installed?"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        project_id = request.data.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return Response(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if self.allowed_project_types and project.type not in self.allowed_project_types:
+            return Response(
+                {
+                    "error": f"Endpoint only supports {self.allowed_project_types} projects."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        requested_models = request.data.get("models") or ["det", "rec"]
+        if not isinstance(requested_models, (list, tuple, set)):
+            requested_models = [requested_models]
+        requested_models = [m for m in requested_models if m in ("det", "rec")]
+        if not requested_models:
+            return Response(
+                {"error": "No valid models provided. Use any of: det, rec."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        loaded: dict[str, dict] = {}
+        errors: dict[str, str] = {}
+
+        for target in requested_models:
+            try:
+                inference_dir, checkpoint_prefix = _export_trained_model(
+                    project.id, target
+                )
+                model_key = _TRAINED_MODEL_KEY.format(
+                    project_id=project.id, target=target
+                )
+                if target == "det":
+                    detector = TextDetection(model_dir=str(inference_dir))
+                    _DETECTOR_CACHE[model_key] = detector
+                    ACTIVE_DET_MODEL_NAME = model_key
+                else:
+                    recognizer = TextRecognition(model_dir=str(inference_dir))
+                    _RECOGNIZER_CACHE[model_key] = recognizer
+                    ACTIVE_REC_MODEL_NAME = model_key
+
+                loaded[target] = {
+                    "model_key": model_key,
+                    "checkpoint": str(checkpoint_prefix),
+                    "inference_dir": str(inference_dir),
+                }
+            except FileNotFoundError as exc:
+                errors[target] = str(exc)
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception(
+                    "Failed to load trained %s model for project %s: %s",
+                    target,
+                    project.id,
+                    exc,
+                )
+                errors[target] = f"Failed to load {target} model: {exc}"
+
+        if not loaded:
+            return Response(
+                {"error": "Unable to load trained models.", "details": errors},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response(
+            {
+                "project_id": project.id,
+                "loaded": loaded,
+                "errors": errors or None,
+                "active": {
+                    "detect_model": ACTIVE_DET_MODEL_NAME,
+                    "recognize_model": ACTIVE_REC_MODEL_NAME,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=False, methods=["post"])
     def configure_models(self, request):
