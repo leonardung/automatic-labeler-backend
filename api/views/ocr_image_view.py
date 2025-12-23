@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 import subprocess
 import sys
@@ -501,6 +502,143 @@ class OcrImageViewSet(BaseImageViewSet):
         if min_x == max_x or min_y == max_y:
             return None
         return (min_x, min_y, max_x, max_y)
+
+    @action(detail=False, methods=["post"])
+    def upload_dataset(self, request):
+        """
+        Bulk upload OCR annotations from a PaddleOCR-style label txt.
+        Each line should be: <image_name>\\t<json annotations>.
+        """
+        project_id = request.data.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        dataset_file = request.FILES.get("dataset") or request.FILES.get("file")
+        raw_text = ""
+        if dataset_file:
+            try:
+                raw_text = dataset_file.read().decode("utf-8-sig")
+            except Exception:
+                return Response(
+                    {"error": "Unable to read dataset file."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            raw_text = request.data.get("dataset_text") or ""
+
+        if not raw_text.strip():
+            return Response(
+                {"error": "No dataset content provided."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return Response(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if self.allowed_project_types and project.type not in self.allowed_project_types:
+            return Response(
+                {"error": f"Endpoint only supports {self.allowed_project_types} projects."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        images = (
+            ImageModel.objects.filter(project=project)
+            .prefetch_related("ocr_annotations")
+            .all()
+        )
+        image_lookup: dict[str, ImageModel] = {}
+        for img in images:
+            names = {Path(img.image.name).name}
+            if img.original_filename:
+                names.add(Path(img.original_filename).name)
+            for name in names:
+                image_lookup.setdefault(name, img)
+
+        summary = {
+            "processed_lines": 0,
+            "updated_images": 0,
+            "annotations": 0,
+            "missing_images": [],
+            "invalid_lines": 0,
+        }
+        updated_image_ids: set[int] = set()
+
+        def _normalize_points(raw_points):
+            normalized = []
+            for pt in raw_points or []:
+                if isinstance(pt, dict):
+                    x, y = pt.get("x"), pt.get("y")
+                elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    x, y = pt[0], pt[1]
+                else:
+                    continue
+                try:
+                    normalized.append({"x": int(float(x)), "y": int(float(y))})
+                except (TypeError, ValueError):
+                    continue
+            return normalized
+
+        lines = raw_text.splitlines()
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                img_name, ann_json = line.split("\t", 1)
+            except ValueError:
+                summary["invalid_lines"] += 1
+                continue
+            filename = Path(img_name).name
+            image = image_lookup.get(filename)
+            if not image:
+                summary["missing_images"].append(filename)
+                continue
+            try:
+                anns = json.loads(ann_json)
+                if not isinstance(anns, list):
+                    raise ValueError("Annotations must be a list.")
+            except Exception:
+                summary["invalid_lines"] += 1
+                continue
+
+            shapes_payload = []
+            for ann in anns:
+                points = _normalize_points(ann.get("points") or [])
+                if not points:
+                    continue
+                rect_points = self._polygon_to_rect(points, tolerance_ratio=0)
+                shapes_payload.append(
+                    {
+                        "type": "rect" if rect_points else "polygon",
+                        "points": rect_points or points,
+                        "text": ann.get("transcription") or "",
+                        "category": ann.get("key_cls") or ann.get("category"),
+                    }
+                )
+
+            saved = self._replace_annotations(image, shapes_payload)
+            summary["processed_lines"] += 1
+            summary["annotations"] += len(saved)
+            if image.id not in updated_image_ids:
+                updated_image_ids.add(image.id)
+                summary["updated_images"] += 1
+
+        return Response(
+            {
+                "project_id": project.id,
+                "summary": summary,
+                "updated_image_ids": sorted(updated_image_ids),
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=False, methods=["post"])
     def configure_trained_models(self, request):

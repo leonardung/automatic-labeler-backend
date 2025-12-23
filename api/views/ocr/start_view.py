@@ -497,8 +497,6 @@ def _prepare_datasets(project: Project, config: dict) -> dict:
     val_samples = _expand_samples(base_val_samples, val_target)
     train_count = len(base_train_samples)
     test_count = len(base_val_samples)
-    print(f"{test_count=}")
-    print(f"{train_count=}")
     train_annotations = sum(len(s["shapes"]) for s in base_train_samples)
     test_annotations = sum(len(s["shapes"]) for s in base_val_samples)
 
