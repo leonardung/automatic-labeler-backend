@@ -1,4 +1,4 @@
-import inspect
+import math
 import json
 import logging
 import subprocess
@@ -13,6 +13,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from api.models.image import ImageModel
+from api.models.mask import MaskCategory
 from api.models.ocr import OcrAnnotation
 from api.models.project import Project
 from api.serializers import ImageModelSerializer
@@ -503,6 +504,37 @@ class OcrImageViewSet(BaseImageViewSet):
             return None
         return (min_x, min_y, max_x, max_y)
 
+    @staticmethod
+    def _color_for_name(offset: int = 0) -> str:
+        """
+        Generate a stable, well-spaced RGBA color for a given name using a golden-ratio hue walk.
+        """
+
+        GOLDEN_RATIO = 0.61803398875
+
+        def hsv_to_rgb(h: float, s: float, v: float):
+            i = math.floor(h * 6)
+            f = h * 6 - i
+            p = v * (1 - s)
+            q = v * (1 - f * s)
+            t = v * (1 - (1 - f) * s)
+            mod = i % 6
+
+            r = [v, q, p, p, t, v][mod]
+            g = [t, v, v, q, p, p][mod]
+            b = [p, p, t, v, v, q][mod]
+
+            return (
+                round(r * 255),
+                round(g * 255),
+                round(b * 255),
+            )
+
+        GOLDEN_RATIO = 0.61803398875
+        hue = (offset * GOLDEN_RATIO) % 1
+        r, g, b = hsv_to_rgb(hue, 0.65, 0.95)
+        return f"rgba({r},{g},{b},0.6)"
+
     @action(detail=False, methods=["post"])
     def upload_dataset(self, request):
         """
@@ -543,9 +575,14 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if self.allowed_project_types and project.type not in self.allowed_project_types:
+        if (
+            self.allowed_project_types
+            and project.type not in self.allowed_project_types
+        ):
             return Response(
-                {"error": f"Endpoint only supports {self.allowed_project_types} projects."},
+                {
+                    "error": f"Endpoint only supports {self.allowed_project_types} projects."
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -570,6 +607,7 @@ class OcrImageViewSet(BaseImageViewSet):
             "invalid_lines": 0,
         }
         updated_image_ids: set[int] = set()
+        category_names: set[str] = set()
 
         def _normalize_points(raw_points):
             normalized = []
@@ -615,12 +653,15 @@ class OcrImageViewSet(BaseImageViewSet):
                 if not points:
                     continue
                 rect_points = self._polygon_to_rect(points, tolerance_ratio=0)
+                category = (ann.get("key_cls") or ann.get("category") or "").strip()
+                if category:
+                    category_names.add(category)
                 shapes_payload.append(
                     {
                         "type": "rect" if rect_points else "polygon",
                         "points": rect_points or points,
                         "text": ann.get("transcription") or "",
-                        "category": ann.get("key_cls") or ann.get("category"),
+                        "category": category,
                     }
                 )
 
@@ -630,6 +671,22 @@ class OcrImageViewSet(BaseImageViewSet):
             if image.id not in updated_image_ids:
                 updated_image_ids.add(image.id)
                 summary["updated_images"] += 1
+
+        if project.type == "ocr_kie" and category_names:
+            existing = {
+                c.name.lower(): c for c in MaskCategory.objects.filter(project=project)
+            }
+            to_create = []
+            for idx, name in enumerate(sorted(category_names)):
+                norm = name.strip()
+                if not norm:
+                    continue
+                if norm.lower() in existing:
+                    continue
+                color = self._color_for_name(offset=len(existing) + idx)
+                to_create.append(MaskCategory(project=project, name=norm, color=color))
+            if to_create:
+                MaskCategory.objects.bulk_create(to_create)
 
         return Response(
             {
@@ -668,7 +725,10 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        if self.allowed_project_types and project.type not in self.allowed_project_types:
+        if (
+            self.allowed_project_types
+            and project.type not in self.allowed_project_types
+        ):
             return Response(
                 {
                     "error": f"Endpoint only supports {self.allowed_project_types} projects."
