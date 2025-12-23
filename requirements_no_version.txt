@@ -1,0 +1,16 @@
+asgiref
+django
+django-cors-headers
+djangorestframework
+djangorestframework-simplejwt
+ffmpeg-python
+matplotlib
+numpy
+opencv-python
+Pillow
+scipy
+sqlparse
+tqdm
+tzdata
+decord
+# git+https://github.com/facebookresearch/sam3.git
