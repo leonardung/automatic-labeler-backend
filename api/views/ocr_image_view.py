@@ -42,6 +42,7 @@ ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
 ACTIVE_REC_MODEL_NAME = DEFAULT_REC_MODEL_NAME
 _TRAINED_INFERENCE_SUBDIR = "inference"
 _TRAINED_MODEL_KEY = "trained-project-{project_id}-{target}"
+_DATASET_PROGRESS: dict[tuple[int, int], dict] = {}
 
 
 def _trained_model_dir(project_id: int | str, target: str) -> Path:
@@ -608,6 +609,7 @@ class OcrImageViewSet(BaseImageViewSet):
         }
         updated_image_ids: set[int] = set()
         category_names: set[str] = set()
+        total_lines = len([ln for ln in raw_text.splitlines() if ln.strip()])
 
         def _normalize_points(raw_points):
             normalized = []
@@ -625,6 +627,13 @@ class OcrImageViewSet(BaseImageViewSet):
             return normalized
 
         lines = raw_text.splitlines()
+        progress_key = (request.user.id, project.id)
+        _DATASET_PROGRESS[progress_key] = {
+            "status": "running",
+            "percent": 0,
+            "processed": 0,
+            "total": total_lines,
+        }
         for raw_line in lines:
             line = raw_line.strip()
             if not line:
@@ -671,6 +680,15 @@ class OcrImageViewSet(BaseImageViewSet):
             if image.id not in updated_image_ids:
                 updated_image_ids.add(image.id)
                 summary["updated_images"] += 1
+            if total_lines > 0:
+                _DATASET_PROGRESS[progress_key] = {
+                    "status": "running",
+                    "percent": min(
+                        100, int(summary["processed_lines"] / total_lines * 100)
+                    ),
+                    "processed": summary["processed_lines"],
+                    "total": total_lines,
+                }
 
         if project.type == "ocr_kie" and category_names:
             existing = {
@@ -688,6 +706,13 @@ class OcrImageViewSet(BaseImageViewSet):
             if to_create:
                 MaskCategory.objects.bulk_create(to_create)
 
+        _DATASET_PROGRESS[progress_key] = {
+            "status": "completed",
+            "percent": 100,
+            "processed": summary["processed_lines"],
+            "total": total_lines,
+        }
+
         return Response(
             {
                 "project_id": project.id,
@@ -696,6 +721,33 @@ class OcrImageViewSet(BaseImageViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=False, methods=["get"])
+    def dataset_progress(self, request):
+        """
+        Return the last known dataset import progress for a project/user.
+        """
+        project_id = request.query_params.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return Response(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        key = (request.user.id, project.id)
+        progress = _DATASET_PROGRESS.get(key) or {
+            "status": "idle",
+            "percent": 0,
+            "processed": 0,
+            "total": 0,
+        }
+        return Response({"project_id": project.id, "progress": progress})
 
     @action(detail=False, methods=["post"])
     def configure_trained_models(self, request):
