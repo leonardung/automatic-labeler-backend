@@ -741,12 +741,20 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
         key = (request.user.id, project.id)
+        if request.query_params.get("reset"):
+            _DATASET_PROGRESS[key] = {
+                "status": "idle",
+                "percent": 0,
+                "processed": 0,
+                "total": 0,
+            }
         progress = _DATASET_PROGRESS.get(key) or {
             "status": "idle",
             "percent": 0,
             "processed": 0,
             "total": 0,
         }
+        print("requests", progress)
         return Response({"project_id": project.id, "progress": progress})
 
     @action(detail=False, methods=["post"])
