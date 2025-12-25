@@ -13,4 +13,5 @@ sqlparse
 tqdm
 tzdata
 decord
+paddlex[ocr]
 # git+https://github.com/facebookresearch/sam3.git
