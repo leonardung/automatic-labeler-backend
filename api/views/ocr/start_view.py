@@ -840,6 +840,7 @@ def _train_model(
                 f"Eval.dataset.label_file_list={kie_model_cfg['dataset_val']}",
                 "Eval.dataset.ratio_list=1",
                 "Eval.loader.batch_size_per_card=1",
+                "Train.loader.batch_size_per_card=1",
             ]
         )
 

@@ -40,6 +40,7 @@ _DETECTOR_CACHE: dict[str, TextDetection] = {}
 _RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
 ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
 ACTIVE_REC_MODEL_NAME = DEFAULT_REC_MODEL_NAME
+DEFAULT_KIE_CATEGORIES = ["header", "field", "value", "table"]
 _TRAINED_INFERENCE_SUBDIR = "inference"
 _TRAINED_MODEL_KEY = "trained-project-{project_id}-{target}"
 _DATASET_PROGRESS: dict[tuple[int, int], dict] = {}
@@ -320,8 +321,16 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        categories = []
+        if image.project.type == "ocr_kie":
+            categories = self._resolve_kie_categories(request, image)
+            recognized_payload = self._classify_kie_shapes(recognized_payload, categories)
+
         saved = self._upsert_annotations(image, recognized_payload)
-        return Response({"shapes": saved}, status=status.HTTP_200_OK)
+        response_payload = {"shapes": saved}
+        if categories:
+            response_payload["categories"] = categories
+        return Response(response_payload, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def classify_kie(self, request, pk=None):
@@ -333,22 +342,9 @@ class OcrImageViewSet(BaseImageViewSet):
         if error:
             return error
         shapes = request.data.get("shapes") or []
-        incoming_categories = request.data.get("categories") or []
-        fallback_categories = incoming_categories or [
-            "header",
-            "field",
-            "value",
-            "table",
-        ]
+        fallback_categories = self._resolve_kie_categories(request, image)
 
-        classified = []
-        for idx, shape in enumerate(shapes):
-            category = (
-                shape.get("category")
-                or fallback_categories[idx % len(fallback_categories)]
-            )
-            classified.append({**shape, "category": category})
-
+        classified = self._classify_kie_shapes(shapes, fallback_categories)
         saved = self._upsert_annotations(image, classified)
         return Response(
             {"shapes": saved, "categories": fallback_categories},
@@ -396,6 +392,30 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         return None
+
+    def _resolve_kie_categories(self, request, image: ImageModel) -> list[str]:
+        incoming_categories = request.data.get("categories") or []
+        cleaned_categories = [c for c in incoming_categories if isinstance(c, str) and c]
+        if cleaned_categories:
+            return cleaned_categories
+
+        project_categories = list(
+            MaskCategory.objects.filter(project=image.project).values_list("name", flat=True)
+        )
+        if project_categories:
+            return list(project_categories)
+        return DEFAULT_KIE_CATEGORIES.copy()
+
+    def _classify_kie_shapes(self, shapes: list[dict], categories: list[str]) -> list[dict]:
+        if not shapes:
+            return []
+        if not categories:
+            categories = DEFAULT_KIE_CATEGORIES
+        classified = []
+        for idx, shape in enumerate(shapes):
+            category = shape.get("category") or categories[idx % len(categories)]
+            classified.append({**shape, "category": category})
+        return classified
 
     @staticmethod
     def _shape_from_annotation(annotation: OcrAnnotation):
