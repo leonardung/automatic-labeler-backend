@@ -1,3 +1,6 @@
+import shutil
+from pathlib import Path
+
 from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -58,3 +61,38 @@ class OcrTrainingRunListView(APIView):
 
         runs = [_serialize_run(run) for run in runs_qs.order_by("-created_at")[:200]]
         return JsonResponse({"runs": runs}, status=status.HTTP_200_OK)
+
+    def delete(self, request):
+        project_id = request.data.get("project_id") or request.query_params.get("project_id")
+        run_id = request.data.get("run_id") or request.query_params.get("run_id")
+        if not project_id or not run_id:
+            return JsonResponse(
+                {"error": "project_id and run_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return JsonResponse(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            run = TrainingRun.objects.get(id=run_id, project=project)
+        except TrainingRun.DoesNotExist:
+            return JsonResponse(
+                {"error": "Run not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        models_dir = Path(run.models_dir) if run.models_dir else None
+        run.delete()
+        if models_dir and models_dir.exists():
+            try:
+                shutil.rmtree(models_dir)
+            except Exception:
+                # Best-effort cleanup; ignore filesystem errors
+                pass
+
+        return JsonResponse({"deleted": str(run_id)}, status=status.HTTP_200_OK)
