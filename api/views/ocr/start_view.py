@@ -89,7 +89,7 @@ def _parse_best_metric_line(line: str) -> Optional[dict]:
             continue
         try:
             if "." in raw_val:
-                best[key] = float(raw_val)
+                best[key] = round(float(raw_val), 4)
             else:
                 best[key] = int(raw_val)
         except Exception:
