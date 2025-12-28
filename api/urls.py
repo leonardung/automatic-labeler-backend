@@ -11,6 +11,7 @@ from api.views import (
     OcrTrainingJobStopView,
     OcrTrainingJobView,
     OcrTrainingStartView,
+    OcrTrainingRunListView,
     ProjectViewSet,
     SegmentationImageViewSet,
     VideoViewSet,
@@ -33,4 +34,5 @@ urlpatterns = [
     path("ocr-training/jobs/", OcrTrainingJobListView.as_view(), name="ocr-training-jobs"),
     path("ocr-training/jobs/<str:job_id>/stop/", OcrTrainingJobStopView.as_view(), name="ocr-training-job-stop"),
     path("ocr-training/jobs/<str:job_id>/logs/", OcrTrainingJobLogsView.as_view(), name="ocr-training-job-logs"),
+    path("ocr-training/runs/", OcrTrainingRunListView.as_view(), name="ocr-training-runs"),
 ]

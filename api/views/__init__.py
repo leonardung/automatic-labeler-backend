@@ -10,6 +10,7 @@ from .ocr import (
     OcrTrainingJobStopView,
     OcrTrainingJobView,
     OcrTrainingStartView,
+    OcrTrainingRunListView,
 )
 from .video_view import VideoViewSet
 from .model_manager_view import ModelManagerViewSet
@@ -26,6 +27,7 @@ __all__ = [
     "OcrTrainingJobStopView",
     "OcrTrainingJobView",
     "OcrTrainingStartView",
+    "OcrTrainingRunListView",
     "VideoViewSet",
     "ModelManagerViewSet",
 ]

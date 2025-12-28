@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -20,7 +21,7 @@ from rest_framework_simplejwt.authentication import JWTAuthentication
 
 from api.models.image import ImageModel
 from api.models.project import Project
-from api.models.training import TrainingConfig
+from api.models.training import TrainingConfig, TrainingRun
 
 from . import helper
 
@@ -29,6 +30,122 @@ log = logging.getLogger(__name__)
 
 class TrainingCancelled(Exception):
     """Raised when a training run is intentionally stopped by the user."""
+
+
+_MAX_METRIC_RECORDS = 2000
+
+
+def _create_training_run(
+    project: Project, job: helper.TrainingJob, target: str, models_dir: Path
+) -> TrainingRun:
+    run = TrainingRun.objects.create(
+        id=uuid.uuid4(),
+        job_id=job.id,
+        user_id=job.user_id,
+        project=project,
+        target=target,
+        status="pending",
+        models_dir=str(models_dir),
+        log_path=str(job.log_path) if job.log_path else "",
+    )
+    return run
+
+
+def _parse_progress_line(line: str) -> Optional[dict]:
+    if "epoch" not in line:
+        return None
+    progress_match = re.search(r"epoch:\s*\[(\d+)\s*/\s*(\d+)\]", line)
+    if not progress_match:
+        return None
+    current_epoch = int(progress_match.group(1))
+    total_epoch = int(progress_match.group(2))
+    kv_pairs = re.findall(r"([A-Za-z0-9_]+):\s*([-+]?\d*\.?\d+)", line)
+    metrics = {}
+    for key, raw_val in kv_pairs:
+        if str(key).isdigit():
+            continue
+        try:
+            if "." in raw_val:
+                metrics[key] = float(raw_val)
+            else:
+                metrics[key] = int(raw_val)
+        except Exception:
+            continue
+    metrics["epoch_current"] = current_epoch
+    metrics["epoch_total"] = total_epoch
+    timestamp_match = re.search(r"\[(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\]", line)
+    if timestamp_match:
+        metrics["timestamp"] = timestamp_match.group(1)
+    return metrics
+
+
+def _parse_best_metric_line(line: str) -> Optional[dict]:
+    if "best metric" not in line.lower():
+        return None
+    kv_pairs = re.findall(r"([A-Za-z0-9_]+):\s*([-+]?\d*\.?\d+)", line)
+    best = {}
+    for key, raw_val in kv_pairs:
+        if str(key).isdigit():
+            continue
+        try:
+            if "." in raw_val:
+                best[key] = float(raw_val)
+            else:
+                best[key] = int(raw_val)
+        except Exception:
+            continue
+    timestamp_match = re.search(r"\[(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\]", line)
+    if timestamp_match:
+        best["timestamp"] = timestamp_match.group(1)
+    return best
+
+
+def _append_metric(run: TrainingRun, metric: dict):
+    metrics_log = list(run.metrics_log or [])
+    metrics_log.append(metric)
+    if len(metrics_log) > _MAX_METRIC_RECORDS:
+        metrics_log = metrics_log[-_MAX_METRIC_RECORDS:]
+    run.metrics_log = metrics_log
+    run.save(update_fields=["metrics_log"])
+
+
+def _update_run_status(
+    run: TrainingRun, status_value: str, error: Optional[str] = None
+):
+    run.status = status_value
+    run.error = error
+    run.finished_at = datetime.utcnow()
+    run.save(update_fields=["status", "error", "finished_at"])
+
+
+def _checkpoint_prefix(models_dir: Path, prefer_best: bool) -> Optional[Path]:
+    if not models_dir.exists():
+        return None
+    if prefer_best:
+        candidates = [
+            models_dir / "best_accuracy",
+            models_dir / "best_model" / "model",
+            models_dir / "best_model" / "best_model",
+            models_dir / "latest",
+            models_dir / "latest" / "model",
+            models_dir / "latest" / "model_state",
+        ]
+    else:
+        candidates = [
+            models_dir / "latest",
+            models_dir / "latest" / "model",
+            models_dir / "latest" / "model_state",
+            models_dir / "best_accuracy",
+            models_dir / "best_model" / "model",
+            models_dir / "best_model" / "best_model",
+        ]
+    for cand in candidates:
+        if cand.with_suffix(".pdparams").exists():
+            return cand
+    pdparams = sorted(models_dir.rglob("*.pdparams"))
+    if pdparams:
+        return pdparams[0].with_suffix("")
+    return None
 
 
 class OcrTrainingStartView(APIView):
@@ -399,12 +516,35 @@ def _run_training(job: helper.TrainingJob):
             return
 
         success = True
+        runs_by_target: dict[str, TrainingRun] = {}
         for target in job.targets:
             try:
                 _check_stop(job)
-                _train_model(target, project, dataset_info, global_cfg, overrides, job)
+                run = runs_by_target.get(target)
+                if run is None:
+                    models_dir = _ensure_dir(
+                        helper.MEDIA_PROJECT_ROOT
+                        / str(project.id)
+                        / "models"
+                        / job.id
+                        / target
+                    )
+                    run = _create_training_run(project, job, target, models_dir)
+                    runs_by_target[target] = run
+                _train_model(
+                    target,
+                    project,
+                    dataset_info,
+                    global_cfg,
+                    overrides,
+                    job,
+                    run=run,
+                )
             except TrainingCancelled:
                 success = False
+                for run in runs_by_target.values():
+                    if run.status not in ("completed", "failed", "stopped"):
+                        _update_run_status(run, "stopped", error="Stopped by user.")
                 helper._finish_job(job, "stopped", error="Stopped by user.")
                 job.append_log("Training stopped.\n")
                 break
@@ -413,6 +553,9 @@ def _run_training(job: helper.TrainingJob):
                 job.append_log(f"[{target}] failed: {exc}\n")
                 job.error = str(exc)
                 success = False
+                run = runs_by_target.get(target)
+                if run:
+                    _update_run_status(run, "failed", error=str(exc))
                 helper._finish_job(job, "failed", error=str(exc))
                 break
 
@@ -752,6 +895,7 @@ def _train_model(
     global_cfg: dict,
     overrides: dict,
     job: helper.TrainingJob,
+    run: Optional[TrainingRun] = None,
 ):
     _check_stop(job)
     cfg_path = {
@@ -766,9 +910,16 @@ def _train_model(
     if not global_cfg.get("use_gpu", True):
         paddle_env["CUDA_VISIBLE_DEVICES"] = ""
 
-    models_dir = _ensure_dir(
-        helper.MEDIA_PROJECT_ROOT / str(project.id) / "models" / target
-    )
+    if run is None:
+        models_dir = _ensure_dir(
+            helper.MEDIA_PROJECT_ROOT / str(project.id) / "models" / job.id / target
+        )
+    else:
+        models_dir = Path(run.models_dir)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        run.status = "running"
+        run.started_at = datetime.utcnow()
+        run.save(update_fields=["status", "started_at", "models_dir"])
 
     cmd = [
         str(Path(sys.executable if "sys" in globals() else "python")),
@@ -788,6 +939,7 @@ def _train_model(
                 f"Train.dataset.label_file_list=['{det['train_label']}']",
                 f"Eval.dataset.data_dir={det['data_dir']}",
                 f"Eval.dataset.label_file_list=['{det['val_label']}']",
+                "Train.loader.batch_size_per_card=1",
             ]
         )
     elif target == "rec":
@@ -878,6 +1030,14 @@ def _train_model(
                     process.kill()
                 raise TrainingCancelled()
             job.append_log(f"[{target}] {line}", persist=True)
+            if run:
+                metric = _parse_progress_line(line)
+                if metric:
+                    _append_metric(run, metric)
+                best_metric = _parse_best_metric_line(line)
+                if best_metric:
+                    run.best_metric = best_metric
+                    run.save(update_fields=["best_metric"])
         ret = process.wait()
         if job.stop_requested:
             raise TrainingCancelled()
@@ -885,3 +1045,10 @@ def _train_model(
             raise RuntimeError(f"{target} training exited with code {ret}")
     finally:
         job.current_process = None
+
+    if run:
+        best_prefix = _checkpoint_prefix(models_dir, prefer_best=True)
+        latest_prefix = _checkpoint_prefix(models_dir, prefer_best=False)
+        run.best_checkpoint = str(best_prefix) if best_prefix else ""
+        run.latest_checkpoint = str(latest_prefix) if latest_prefix else ""
+        _update_run_status(run, "completed")

@@ -15,5 +15,4 @@ sqlparse==0.5.1
 tqdm==4.66.5
 tzdata==2024.2
 decord==0.6.0
-paddlex==3.0.0
 # git+https://github.com/facebookresearch/sam3.git

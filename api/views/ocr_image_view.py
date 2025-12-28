@@ -16,6 +16,7 @@ from api.models.image import ImageModel
 from api.models.mask import MaskCategory
 from api.models.ocr import OcrAnnotation
 from api.models.project import Project
+from api.models.training import TrainingRun
 from api.serializers import ImageModelSerializer
 from api.views.ocr import helper as ocr_helper
 from .base_image_view import BaseImageViewSet
@@ -50,18 +51,28 @@ def _trained_model_dir(project_id: int | str, target: str) -> Path:
     return ocr_helper.MEDIA_PROJECT_ROOT / str(project_id) / "models" / target
 
 
-def _find_checkpoint_prefix(models_dir: Path) -> Path:
+def _find_checkpoint_prefix(models_dir: Path, prefer_best: bool = True) -> Path:
     """
-    Return the checkpoint prefix (without extension) for the best available weights.
-    Preference order: best_accuracy, best_model/model, latest, any *.pdparams.
+    Return the checkpoint prefix (without extension) for available weights.
+    Preference order (best): best_accuracy, best_model/model, latest, any *.pdparams.
+    Preference order (latest): latest, latest/model, latest/model_state, best_accuracy, best_model/model, any *.pdparams.
     """
-    candidates = [
-        models_dir / "best_accuracy",
-        models_dir / "best_model" / "model",
-        models_dir / "latest",
-        models_dir / "latest" / "model",
-        models_dir / "latest" / "model_state",
-    ]
+    if prefer_best:
+        candidates = [
+            models_dir / "best_accuracy",
+            models_dir / "best_model" / "model",
+            models_dir / "latest",
+            models_dir / "latest" / "model",
+            models_dir / "latest" / "model_state",
+        ]
+    else:
+        candidates = [
+            models_dir / "latest",
+            models_dir / "latest" / "model",
+            models_dir / "latest" / "model_state",
+            models_dir / "best_accuracy",
+            models_dir / "best_model" / "model",
+        ]
     for prefix in candidates:
         if prefix.with_suffix(".pdparams").exists():
             return prefix
@@ -82,13 +93,30 @@ def _has_inference_files(inference_dir: Path) -> bool:
     return has_model_file and has_params
 
 
-def _export_trained_model(project_id: int | str, target: str) -> tuple[Path, Path]:
+def _export_trained_model(
+    project_id: int | str,
+    target: str,
+    run_id: str | None = None,
+    checkpoint_type: str = "best",
+) -> tuple[Path, Path, TrainingRun | None]:
     """
     Export a trained PaddleOCR model to inference format.
 
-    Returns (inference_dir, checkpoint_prefix).
+    Returns (inference_dir, checkpoint_prefix, training_run_used).
     """
-    models_dir = _trained_model_dir(project_id, target)
+    prefer_best = checkpoint_type != "latest"
+    run: TrainingRun | None = None
+    run_qs = TrainingRun.objects.filter(
+        project_id=project_id, target=target, status="completed"
+    )
+    if run_id:
+        run_qs = run_qs.filter(id=run_id)
+    run = run_qs.order_by("-created_at").first()
+
+    if run:
+        models_dir = Path(run.models_dir)
+    else:
+        models_dir = _trained_model_dir(project_id, target)
     if not models_dir.exists():
         raise FileNotFoundError(
             f"No trained {target} model directory found for project {project_id}."
@@ -100,7 +128,20 @@ def _export_trained_model(project_id: int | str, target: str) -> tuple[Path, Pat
             f"Config file not found for trained {target} model at {config_path}."
         )
 
-    checkpoint_prefix = _find_checkpoint_prefix(models_dir)
+    checkpoint_prefix: Path
+    run_checkpoint = None
+    if run:
+        run_checkpoint = run.best_checkpoint if prefer_best else run.latest_checkpoint
+    if run_checkpoint:
+        candidate = Path(run_checkpoint)
+        if candidate.with_suffix(".pdparams").exists():
+            checkpoint_prefix = candidate
+        else:
+            checkpoint_prefix = _find_checkpoint_prefix(
+                models_dir, prefer_best=prefer_best
+            )
+    else:
+        checkpoint_prefix = _find_checkpoint_prefix(models_dir, prefer_best=prefer_best)
     inference_dir = models_dir / _TRAINED_INFERENCE_SUBDIR
     checkpoint_path = checkpoint_prefix.with_suffix(".pdparams")
 
@@ -114,7 +155,7 @@ def _export_trained_model(project_id: int | str, target: str) -> tuple[Path, Pat
             needs_export = True
 
     if not needs_export:
-        return inference_dir, checkpoint_prefix
+        return inference_dir, checkpoint_prefix, run
 
     cmd = [
         sys.executable,
@@ -138,7 +179,7 @@ def _export_trained_model(project_id: int | str, target: str) -> tuple[Path, Pat
             f"Failed to export {target} model for project {project_id}: {err_output}"
         )
 
-    return inference_dir, checkpoint_prefix
+    return inference_dir, checkpoint_prefix, run
 
 
 class OcrImageViewSet(BaseImageViewSet):
@@ -826,16 +867,28 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        runs_map = request.data.get("runs") or {}
+        checkpoint_map = request.data.get("checkpoint_type") or {}
+
         loaded: dict[str, dict] = {}
         errors: dict[str, str] = {}
 
         for target in requested_models:
+            run_id = runs_map.get(target) if isinstance(runs_map, dict) else None
+            checkpoint_type = checkpoint_map.get(target) if isinstance(checkpoint_map, dict) else None
+            checkpoint_type = (checkpoint_type or "best").lower()
+            if checkpoint_type not in ("best", "latest"):
+                checkpoint_type = "best"
             try:
-                inference_dir, checkpoint_prefix = _export_trained_model(
-                    project.id, target
+                inference_dir, checkpoint_prefix, run_used = _export_trained_model(
+                    project.id,
+                    target,
+                    run_id=run_id,
+                    checkpoint_type=checkpoint_type,
                 )
                 model_key = _TRAINED_MODEL_KEY.format(
-                    project_id=project.id, target=target
+                    project_id=project.id,
+                    target=f"{target}-{run_used.id if run_used else 'latest'}",
                 )
                 if target == "det":
                     detector = TextDetection(model_dir=str(inference_dir))
@@ -850,6 +903,8 @@ class OcrImageViewSet(BaseImageViewSet):
                     "model_key": model_key,
                     "checkpoint": str(checkpoint_prefix),
                     "inference_dir": str(inference_dir),
+                    "run_id": str(run_used.id) if run_used else None,
+                    "checkpoint_type": checkpoint_type,
                 }
             except FileNotFoundError as exc:
                 errors[target] = str(exc)
