@@ -51,6 +51,64 @@ def _trained_model_dir(project_id: int | str, target: str) -> Path:
     return ocr_helper.MEDIA_PROJECT_ROOT / str(project_id) / "models" / target
 
 
+def _latest_model_dir(project_id: int | str, target: str) -> Path | None:
+    """
+    Return the most recent models/<job>/<target> directory for a project, if any.
+    """
+    base = ocr_helper.MEDIA_PROJECT_ROOT / str(project_id) / "models"
+    if not base.exists():
+        return None
+    candidates: list[Path] = []
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        cand = child / target
+        if cand.exists() and cand.is_dir():
+            candidates.append(cand)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_models_dir(path_str: str | None, project_id: int | str, target: str) -> Path:
+    """
+    Normalize a stored models_dir to an existing path, handling Windows->WSL paths.
+    """
+    base_dir = _trained_model_dir(project_id, target)
+    latest_dir = _latest_model_dir(project_id, target)
+    if not path_str:
+        return latest_dir or base_dir
+
+    candidates: list[Path] = []
+    raw_path = Path(path_str)
+    candidates.append(raw_path)
+
+    # If the stored path was relative, try resolving it from the expected base.
+    if not raw_path.is_absolute():
+        candidates.append((base_dir / raw_path).resolve())
+
+    # Translate Windows drive paths (e.g., C:\\foo\\bar) into WSL-style /mnt/c/foo/bar.
+    if ":" in path_str and "\\" in path_str:
+        drive, _, remainder = path_str.partition(":")
+        translated = Path("/mnt") / drive.lower() / remainder.lstrip("\\/").replace("\\", "/")
+        candidates.append(translated)
+
+    # Normalize backslashes to forward slashes as another fallback.
+    if "\\" in path_str:
+        candidates.append(Path(path_str.replace("\\", "/")))
+
+    # Try the most recent job subdir as a final fallback.
+    if latest_dir:
+        candidates.append(latest_dir)
+    # Always include the canonical location as a last resort.
+    candidates.append(base_dir)
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[0]
+
+
 def _find_checkpoint_prefix(models_dir: Path, prefer_best: bool = True) -> Path:
     """
     Return the checkpoint prefix (without extension) for available weights.
@@ -106,17 +164,18 @@ def _export_trained_model(
     """
     prefer_best = checkpoint_type != "latest"
     run: TrainingRun | None = None
-    run_qs = TrainingRun.objects.filter(
-        project_id=project_id, target=target, status="completed"
-    )
+    run_qs = TrainingRun.objects.filter(project_id=project_id, target=target)
     if run_id:
         run_qs = run_qs.filter(id=run_id)
-    run = run_qs.order_by("-created_at").first()
+    # Prefer completed runs first, then fallback to the latest any-status run.
+    run = (
+        run_qs.filter(status="completed").order_by("-finished_at", "-created_at").first()
+        or run_qs.order_by("-finished_at", "-created_at").first()
+    )
 
-    if run:
-        models_dir = Path(run.models_dir)
-    else:
-        models_dir = _trained_model_dir(project_id, target)
+    models_dir = _resolve_models_dir(
+        run.models_dir if run else None, project_id=project_id, target=target
+    )
     if not models_dir.exists():
         raise FileNotFoundError(
             f"No trained {target} model directory found for project {project_id}."

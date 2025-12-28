@@ -11,7 +11,47 @@ from api.models.project import Project
 from api.models.training import TrainingRun
 
 
+def _detect_checkpoints(models_dir: Path) -> tuple[str, str]:
+    """
+    Best-effort checkpoint discovery on disk so Saved Models shows available weights
+    even if the DB fields were not populated (e.g., mid-run or after manual copy).
+    Returns (best_checkpoint, latest_checkpoint) as strings (may be empty).
+    """
+    if not models_dir.exists():
+        return "", ""
+
+    def _first_existing(prefixes):
+        for prefix in prefixes:
+            if prefix.with_suffix(".pdparams").exists():
+                return str(prefix)
+        for pdparams in sorted(models_dir.rglob("*.pdparams")):
+            return str(pdparams.with_suffix(""))
+        return ""
+
+    best_prefix = _first_existing(
+        [
+            models_dir / "best_accuracy",
+            models_dir / "best_model" / "model",
+        ]
+    )
+    latest_prefix = _first_existing(
+        [
+            models_dir / "latest",
+            models_dir / "latest" / "model",
+            models_dir / "latest" / "model_state",
+        ]
+    )
+    return best_prefix, latest_prefix
+
+
 def _serialize_run(run: TrainingRun) -> dict:
+    models_dir = Path(run.models_dir) if run.models_dir else None
+    best_checkpoint = run.best_checkpoint
+    latest_checkpoint = run.latest_checkpoint
+    if models_dir and (not best_checkpoint or not latest_checkpoint):
+        detected_best, detected_latest = _detect_checkpoints(models_dir)
+        best_checkpoint = best_checkpoint or detected_best
+        latest_checkpoint = latest_checkpoint or detected_latest
     return {
         "id": str(run.id),
         "job_id": run.job_id,
@@ -19,8 +59,8 @@ def _serialize_run(run: TrainingRun) -> dict:
         "target": run.target,
         "status": run.status,
         "models_dir": run.models_dir,
-        "best_checkpoint": run.best_checkpoint,
-        "latest_checkpoint": run.latest_checkpoint,
+        "best_checkpoint": best_checkpoint,
+        "latest_checkpoint": latest_checkpoint,
         "best_metric": run.best_metric or {},
         "metrics_log": run.metrics_log or [],
         "log_path": run.log_path,
