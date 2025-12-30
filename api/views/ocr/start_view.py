@@ -1,8 +1,8 @@
+import csv
 import json
 import logging
 import os
 import random
-import re
 import subprocess
 import sys
 import threading
@@ -51,55 +51,6 @@ def _create_training_run(
     return run
 
 
-def _parse_progress_line(line: str) -> Optional[dict]:
-    if "epoch" not in line:
-        return None
-    progress_match = re.search(r"epoch:\s*\[(\d+)\s*/\s*(\d+)\]", line)
-    if not progress_match:
-        return None
-    current_epoch = int(progress_match.group(1))
-    total_epoch = int(progress_match.group(2))
-    kv_pairs = re.findall(r"([A-Za-z0-9_]+):\s*([-+]?\d*\.?\d+)", line)
-    metrics = {}
-    for key, raw_val in kv_pairs:
-        if str(key).isdigit():
-            continue
-        try:
-            if "." in raw_val:
-                metrics[key] = float(raw_val)
-            else:
-                metrics[key] = int(raw_val)
-        except Exception:
-            continue
-    metrics["epoch_current"] = current_epoch
-    metrics["epoch_total"] = total_epoch
-    timestamp_match = re.search(r"\[(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\]", line)
-    if timestamp_match:
-        metrics["timestamp"] = timestamp_match.group(1)
-    return metrics
-
-
-def _parse_best_metric_line(line: str) -> Optional[dict]:
-    if "best metric" not in line.lower():
-        return None
-    kv_pairs = re.findall(r"([A-Za-z0-9_]+):\s*([-+]?\d*\.?\d+)", line)
-    best = {}
-    for key, raw_val in kv_pairs:
-        if str(key).isdigit():
-            continue
-        try:
-            if "." in raw_val:
-                best[key] = round(float(raw_val), 4)
-            else:
-                best[key] = int(raw_val)
-        except Exception:
-            continue
-    timestamp_match = re.search(r"\[(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\]", line)
-    if timestamp_match:
-        best["timestamp"] = timestamp_match.group(1)
-    return best
-
-
 def _append_metric(run: TrainingRun, metric: dict):
     metrics_log = list(run.metrics_log or [])
     metrics_log.append(metric)
@@ -107,6 +58,60 @@ def _append_metric(run: TrainingRun, metric: dict):
         metrics_log = metrics_log[-_MAX_METRIC_RECORDS:]
     run.metrics_log = metrics_log
     run.save(update_fields=["metrics_log"])
+
+
+def _ingest_metrics_csv(run: TrainingRun, csv_path: Path, start_row: int) -> int:
+    """
+    Read structured metrics emitted by PaddleOCR and persist any new rows.
+    Returns the new row offset so callers can resume efficiently.
+    """
+    if run is None:
+        return start_row
+    if start_row < 0:
+        start_row = 0
+    try:
+        with csv_path.open("r", newline="", encoding="utf-8") as fin:
+            rows = list(csv.DictReader(fin))
+    except FileNotFoundError:
+        return start_row
+    except Exception as exc:
+        log.exception("Failed to read metrics CSV %s: %s", csv_path, exc)
+        return start_row
+
+    if start_row >= len(rows):
+        return len(rows)
+
+    for row in rows[start_row:]:
+        phase = (row.get("phase") or "").strip().lower() or "train"
+        metrics_raw = row.get("metrics") or "{}"
+        try:
+            metrics = json.loads(metrics_raw)
+            if not isinstance(metrics, dict):
+                continue
+        except Exception:
+            continue
+
+        epoch_val = _safe_int(row.get("epoch"))
+        global_step = _safe_int(row.get("global_step"))
+        timestamp = row.get("timestamp")
+
+        if phase == "best":
+            run.best_metric = metrics or {}
+            run.save(update_fields=["best_metric"])
+            continue
+
+        metrics = dict(metrics or {})
+        if epoch_val:
+            metrics.setdefault("epoch_current", epoch_val)
+        if "epoch_total" not in metrics and epoch_val:
+            metrics["epoch_total"] = metrics.get("epoch_total") or epoch_val
+        metrics["global_step"] = global_step
+        if timestamp:
+            metrics.setdefault("timestamp", timestamp)
+        metrics["phase"] = phase
+        _append_metric(run, metrics)
+
+    return len(rows)
 
 
 def _update_run_status(
@@ -921,6 +926,8 @@ def _train_model(
         run.started_at = datetime.utcnow()
         run.save(update_fields=["status", "started_at", "models_dir"])
 
+    metrics_csv_path = models_dir / "metrics.csv"
+
     cmd = [
         str(Path(sys.executable if "sys" in globals() else "python")),
         "tools/train.py",
@@ -1019,6 +1026,7 @@ def _train_model(
         env=paddle_env,
     )
     job.current_process = process
+    metrics_row_offset = 0
     try:
         assert process.stdout is not None
         for line in process.stdout:
@@ -1031,13 +1039,9 @@ def _train_model(
                 raise TrainingCancelled()
             job.append_log(f"[{target}] {line}", persist=True)
             if run:
-                metric = _parse_progress_line(line)
-                if metric:
-                    _append_metric(run, metric)
-                best_metric = _parse_best_metric_line(line)
-                if best_metric:
-                    run.best_metric = best_metric
-                    run.save(update_fields=["best_metric"])
+                metrics_row_offset = _ingest_metrics_csv(
+                    run, metrics_csv_path, metrics_row_offset
+                )
         ret = process.wait()
         if job.stop_requested:
             raise TrainingCancelled()
@@ -1045,6 +1049,10 @@ def _train_model(
             raise RuntimeError(f"{target} training exited with code {ret}")
     finally:
         job.current_process = None
+        if run:
+            metrics_row_offset = _ingest_metrics_csv(
+                run, metrics_csv_path, metrics_row_offset
+            )
 
     if run:
         best_prefix = _checkpoint_prefix(models_dir, prefer_best=True)
