@@ -60,6 +60,21 @@ def _append_metric(run: TrainingRun, metric: dict):
     run.save(update_fields=["metrics_log"])
 
 
+def _round_metric_values(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        try:
+            return float(f"{float(val):.4g}")
+        except Exception:
+            return val
+    if isinstance(val, dict):
+        return {k: _round_metric_values(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_round_metric_values(v) for v in val]
+    return val
+
+
 def _ingest_metrics_csv(run: TrainingRun, csv_path: Path, start_row: int) -> int:
     """
     Read structured metrics emitted by PaddleOCR and persist any new rows.
@@ -85,7 +100,7 @@ def _ingest_metrics_csv(run: TrainingRun, csv_path: Path, start_row: int) -> int
         phase = (row.get("phase") or "").strip().lower() or "train"
         metrics_raw = row.get("metrics") or "{}"
         try:
-            metrics = json.loads(metrics_raw)
+            metrics = _round_metric_values(json.loads(metrics_raw))
             if not isinstance(metrics, dict):
                 continue
         except Exception:
