@@ -11,6 +11,7 @@ from PIL import Image
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from django.conf import settings
 
 from api.models.image import ImageModel
 from api.models.mask import MaskCategory
@@ -23,17 +24,10 @@ from .base_image_view import BaseImageViewSet
 
 
 log = logging.getLogger(__name__)
-PADDLE_SUBMODULE_PATH = (
-    Path(__file__).resolve().parent.parent.parent / "submodules" / "PaddleOCR"
-)
-if str(PADDLE_SUBMODULE_PATH) not in sys.path:
-    sys.path.append(str(PADDLE_SUBMODULE_PATH))
-try:
-    from paddleocr import TextDetection, TextRecognition
-except Exception as exc:  # pragma: no cover - import guard for optional dependency
-    TextDetection = None
-    TextRecognition = None
-    log.exception("Failed to import paddleocr: %s", exc)
+PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
+sys.path.append(str(PADDLE_ROOT))
+
+from paddleocr import TextDetection, TextRecognition
 
 DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
 DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
@@ -70,7 +64,9 @@ def _latest_model_dir(project_id: int | str, target: str) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def _resolve_models_dir(path_str: str | None, project_id: int | str, target: str) -> Path:
+def _resolve_models_dir(
+    path_str: str | None, project_id: int | str, target: str
+) -> Path:
     """
     Normalize a stored models_dir to an existing path, handling Windows->WSL paths.
     """
@@ -90,7 +86,9 @@ def _resolve_models_dir(path_str: str | None, project_id: int | str, target: str
     # Translate Windows drive paths (e.g., C:\\foo\\bar) into WSL-style /mnt/c/foo/bar.
     if ":" in path_str and "\\" in path_str:
         drive, _, remainder = path_str.partition(":")
-        translated = Path("/mnt") / drive.lower() / remainder.lstrip("\\/").replace("\\", "/")
+        translated = (
+            Path("/mnt") / drive.lower() / remainder.lstrip("\\/").replace("\\", "/")
+        )
         candidates.append(translated)
 
     # Normalize backslashes to forward slashes as another fallback.
@@ -169,7 +167,9 @@ def _export_trained_model(
         run_qs = run_qs.filter(id=run_id)
     # Prefer completed runs first, then fallback to the latest any-status run.
     run = (
-        run_qs.filter(status="completed").order_by("-finished_at", "-created_at").first()
+        run_qs.filter(status="completed")
+        .order_by("-finished_at", "-created_at")
+        .first()
         or run_qs.order_by("-finished_at", "-created_at").first()
     )
 
@@ -424,7 +424,9 @@ class OcrImageViewSet(BaseImageViewSet):
         categories = []
         if image.project.type == "ocr_kie":
             categories = self._resolve_kie_categories(request, image)
-            recognized_payload = self._classify_kie_shapes(recognized_payload, categories)
+            recognized_payload = self._classify_kie_shapes(
+                recognized_payload, categories
+            )
 
         saved = self._upsert_annotations(image, recognized_payload)
         response_payload = {"shapes": saved}
@@ -495,18 +497,24 @@ class OcrImageViewSet(BaseImageViewSet):
 
     def _resolve_kie_categories(self, request, image: ImageModel) -> list[str]:
         incoming_categories = request.data.get("categories") or []
-        cleaned_categories = [c for c in incoming_categories if isinstance(c, str) and c]
+        cleaned_categories = [
+            c for c in incoming_categories if isinstance(c, str) and c
+        ]
         if cleaned_categories:
             return cleaned_categories
 
         project_categories = list(
-            MaskCategory.objects.filter(project=image.project).values_list("name", flat=True)
+            MaskCategory.objects.filter(project=image.project).values_list(
+                "name", flat=True
+            )
         )
         if project_categories:
             return list(project_categories)
         return DEFAULT_KIE_CATEGORIES.copy()
 
-    def _classify_kie_shapes(self, shapes: list[dict], categories: list[str]) -> list[dict]:
+    def _classify_kie_shapes(
+        self, shapes: list[dict], categories: list[str]
+    ) -> list[dict]:
         if not shapes:
             return []
         if not categories:
@@ -934,7 +942,9 @@ class OcrImageViewSet(BaseImageViewSet):
 
         for target in requested_models:
             run_id = runs_map.get(target) if isinstance(runs_map, dict) else None
-            checkpoint_type = checkpoint_map.get(target) if isinstance(checkpoint_map, dict) else None
+            checkpoint_type = (
+                checkpoint_map.get(target) if isinstance(checkpoint_map, dict) else None
+            )
             checkpoint_type = (checkpoint_type or "best").lower()
             if checkpoint_type not in ("best", "latest"):
                 checkpoint_type = "best"
