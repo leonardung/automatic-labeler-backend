@@ -4,10 +4,12 @@ import logging
 import subprocess
 import sys
 import uuid
+import tempfile
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import yaml
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -25,9 +27,13 @@ from .base_image_view import BaseImageViewSet
 
 log = logging.getLogger(__name__)
 PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
+SUBMODULE_ROOT = Path(settings.BASE_DIR) / "submodules"
 sys.path.append(str(PADDLE_ROOT))
+sys.path.append(str(SUBMODULE_ROOT))
 
 from paddleocr import TextDetection, TextRecognition
+from PaddleOCR.tools import infer_kie_token_ser, program
+from paddlenlp.transformers import LayoutLMv2Tokenizer
 
 DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
 DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
@@ -35,7 +41,10 @@ _DETECTOR_CACHE: dict[str, TextDetection] = {}
 _RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
 ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
 ACTIVE_REC_MODEL_NAME = DEFAULT_REC_MODEL_NAME
+ACTIVE_KIE_MODEL_NAME: str | None = None
 DEFAULT_KIE_CATEGORIES = ["header", "field", "value", "table"]
+DEFAULT_KIE_MAX_SEQ_LEN = 512
+DEFAULT_KIE_MIN_OVERLAP = 64
 _TRAINED_INFERENCE_SUBDIR = "inference"
 _TRAINED_MODEL_KEY = "trained-project-{project_id}-{target}"
 _DATASET_PROGRESS: dict[tuple[int, int], dict] = {}
@@ -181,7 +190,7 @@ def _export_trained_model(
             f"No trained {target} model directory found for project {project_id}."
         )
 
-    config_path = models_dir / "config.yml"
+    config_path = models_dir.parent / "kie/config.yml"
     if not config_path.exists():
         raise FileNotFoundError(
             f"Config file not found for trained {target} model at {config_path}."
@@ -437,21 +446,429 @@ class OcrImageViewSet(BaseImageViewSet):
     @action(detail=True, methods=["post"])
     def classify_kie(self, request, pk=None):
         """
-        Mock KIE classifier that assigns categories in a round-robin fashion.
+        Run SER/KIE classification using PaddleOCR.
+        Requires prior detection and recognition results.
         """
         image: ImageModel = self.get_object()
         error = self._validate_project(image)
         if error:
             return error
         shapes = request.data.get("shapes") or []
-        fallback_categories = self._resolve_kie_categories(request, image)
+        if not shapes:
+            return Response(
+                {"error": "Detection results are required before classification."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        classified = self._classify_kie_shapes(shapes, fallback_categories)
-        saved = self._upsert_annotations(image, classified)
+        if any(not str(shape.get("text") or "").strip() for shape in shapes):
+            return Response(
+                {"error": "Recognition results are required before classification."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        checkpoint_type_raw = (
+            request.data.get("checkpoint_type")
+            or request.query_params.get("checkpoint_type")
+            or "best"
+        )
+        checkpoint_type = str(checkpoint_type_raw).lower()
+        if checkpoint_type not in ("best", "latest"):
+            checkpoint_type = "best"
+
+        model_name = (
+            request.data.get("model_name")
+            or request.query_params.get("model_name")
+            or ACTIVE_KIE_MODEL_NAME
+        )
+        use_gpu_raw = request.data.get("use_gpu")
+        if use_gpu_raw is None:
+            use_gpu_raw = request.query_params.get("use_gpu")
+        use_gpu = (
+            True
+            if use_gpu_raw is None
+            else str(use_gpu_raw).lower() in ("1", "true", "yes", "on")
+        )
+
+        max_len_raw = request.data.get("max_len_per_part") or request.query_params.get(
+            "max_len_per_part"
+        )
+        min_overlap_raw = (
+            request.data.get("min_overlap")
+            or request.data.get("min_token_overlap")
+            or request.query_params.get("min_overlap")
+            or request.query_params.get("min_token_overlap")
+        )
+        try:
+            max_len_per_part = (
+                int(max_len_raw) if max_len_raw is not None else DEFAULT_KIE_MAX_SEQ_LEN
+            )
+            min_overlap = (
+                int(min_overlap_raw)
+                if min_overlap_raw is not None
+                else DEFAULT_KIE_MIN_OVERLAP
+            )
+        except (TypeError, ValueError):
+            return Response(
+                {"error": "Invalid KIE chunking parameters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if max_len_per_part <= 2 or min_overlap < 0 or max_len_per_part <= min_overlap:
+            return Response(
+                {"error": "Invalid KIE chunking parameters."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            resources = self._prepare_kie_resources(
+                project_id=image.project.id,
+                model_name=model_name,
+                checkpoint_type=checkpoint_type,
+            )
+            classified_shapes, categories = self._run_kie_inference(
+                image_path=image.image.path,
+                shapes=shapes,
+                resources=resources,
+                use_gpu=use_gpu,
+                max_len_per_part=max_len_per_part,
+                min_overlap=min_overlap,
+            )
+        except FileNotFoundError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:  # pragma: no cover - runtime dependency
+            log.exception("KIE classification failed for image %s: %s", image.id, exc)
+            return Response(
+                {"error": "KIE classification failed."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        saved = self._upsert_annotations(image, classified_shapes)
         return Response(
-            {"shapes": saved, "categories": fallback_categories},
+            {"shapes": saved, "categories": categories},
             status=status.HTTP_200_OK,
         )
+
+    def _prepare_kie_resources(
+        self, project_id: int | str, model_name: str | None, checkpoint_type: str
+    ) -> dict:
+        run_id: str | None = None
+        if model_name:
+            prefix = _TRAINED_MODEL_KEY.format(project_id=project_id, target="kie")
+            if model_name.startswith(prefix):
+                suffix = model_name.replace(prefix, "", 1).lstrip("-")
+                if suffix and suffix != "latest":
+                    run_id = suffix
+            else:
+                run_id = model_name
+
+        inference_dir, checkpoint_prefix, _ = _export_trained_model(
+            project_id=project_id,
+            target="kie",
+            run_id=run_id,
+            checkpoint_type=checkpoint_type,
+        )
+        config_path = checkpoint_prefix.parent.parent / "config.yml"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Config file not found for trained kie model at {config_path}."
+            )
+
+        class_path = (
+            checkpoint_prefix.parent.parent.parent.parent.parent
+            / "datasets/kie/train_data/class_list.txt"
+        )
+        if not class_path.exists():
+            raise FileNotFoundError(f"Class list not found at {class_path}.")
+
+        font_path = Path("doc/fonts/simfang.ttf")
+        font_path = (PADDLE_ROOT / font_path).resolve()
+        if not font_path.exists():
+            raise FileNotFoundError(f"Font path not found at {font_path}.")
+
+        categories = [
+            line.strip()
+            for line in class_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if not categories:
+            raise FileNotFoundError(
+                f"No categories found in class list file {class_path}."
+            )
+
+        return {
+            "config_path": config_path,
+            "checkpoint_prefix": checkpoint_prefix,
+            "class_path": class_path,
+            "font_path": font_path,
+            "categories": categories,
+            "inference_dir": inference_dir,
+        }
+
+    def _run_kie_inference(
+        self,
+        image_path: str,
+        shapes: list[dict],
+        resources: dict,
+        use_gpu: bool,
+        max_len_per_part: int,
+        min_overlap: int,
+    ) -> tuple[list[dict], list[str]]:
+        img_path = Path(image_path).resolve()
+        if not img_path.exists():
+            raise FileNotFoundError(f"Image not found at {img_path}.")
+
+        annotations, _ = self._build_kie_annotations(shapes)
+        annotations = self._sort_kie_annotations(annotations)
+
+        tokenizer = LayoutLMv2Tokenizer.from_pretrained("layoutlmv2-base-uncased")
+        parts = self._split_by_token_budget(
+            annotations,
+            tokenizer,
+            max_seq_len=max_len_per_part,
+            min_token_overlap=min_overlap,
+        )
+        if not parts:
+            parts = [annotations]
+        lines = [
+            f"{img_path.as_posix()}\t{json.dumps(part, ensure_ascii=False)}"
+            for part in parts
+            if part
+        ]
+        if not lines:
+            raise ValueError("No valid annotations available for KIE classification.")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            label_file = tmp_root / "kie_input.txt"
+            label_file.write_text("\n".join(lines), encoding="utf-8")
+            save_dir = tmp_root / "kie_output"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+            argv_backup = list(sys.argv)
+            sys.argv = [
+                "infer_kie_token_ser.py",
+                "-c",
+                str(resources["config_path"]),
+                "-o",
+                f"Global.use_gpu={use_gpu}",
+                f"Global.class_path={resources['class_path'].as_posix()}",
+                f"PostProcess.class_path={resources['class_path'].as_posix()}",
+                f"Global.font_path={resources['font_path'].as_posix()}",
+                f"Global.infer_img={label_file.as_posix()}",
+                f"Global.save_res_path={save_dir.as_posix()}",
+                "Global.infer_mode=False",
+                f"Architecture.Backbone.checkpoints={resources['checkpoint_prefix'].as_posix()}",
+                "Eval.dataset.data_dir=/",
+                f"Eval.dataset.label_file_list={label_file.as_posix()}",
+            ]
+            try:
+                config, device, logger, vdl_writer = program.preprocess()
+                infer_kie_token_ser.main(config, device, logger, vdl_writer)
+            finally:
+                sys.argv = argv_backup
+
+            result_path = save_dir / "infer_results.txt"
+            if not result_path.exists():
+                raise RuntimeError("KIE inference did not produce results.")
+            predictions = self._parse_kie_results(result_path)
+
+        classified = []
+        missing = []
+        for idx, shape in enumerate(shapes):
+            norm_points = self._normalize_kie_points(shape.get("points"))
+            if not norm_points:
+                raise ValueError("Invalid polygon points found in KIE payload.")
+            key = self._points_key(norm_points)
+            pred = predictions.get(key)
+            if not pred:
+                missing.append(idx)
+                continue
+            classified.append({**shape, "category": pred["label"]})
+
+        if missing:
+            raise ValueError(
+                f"Missing KIE predictions for {len(missing)} shapes; classification aborted."
+            )
+
+        return classified, resources["categories"]
+
+    @staticmethod
+    def _points_key(points: list[list[int]]) -> str:
+        return json.dumps([[int(p[0]), int(p[1])] for p in points], ensure_ascii=False)
+
+    def _normalize_kie_points(self, raw_points) -> list[list[int]] | None:
+        pts: list[list[int]] = []
+        for pt in raw_points or []:
+            try:
+                x, y = pt.get("x"), pt.get("y")
+            except AttributeError:
+                continue
+            try:
+                pts.append([int(round(float(x))), int(round(float(y)))])
+            except (TypeError, ValueError):
+                continue
+
+        if len(pts) < 4:
+            bbox = self._bbox_from_points(raw_points)
+            if bbox:
+                min_x, min_y, max_x, max_y = bbox
+                pts = [
+                    [min_x, min_y],
+                    [max_x, min_y],
+                    [max_x, max_y],
+                    [min_x, max_y],
+                ]
+
+        if len(pts) != 4:
+            return None
+        return [[int(p[0]), int(p[1])] for p in pts]
+
+    def _normalize_prediction_points(self, raw_points) -> list[list[int]] | None:
+        pts: list[list[int]] = []
+        for pt in raw_points or []:
+            if isinstance(pt, dict):
+                x, y = pt.get("x"), pt.get("y")
+            elif isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                x, y = pt[0], pt[1]
+            else:
+                continue
+            try:
+                pts.append([int(round(float(x))), int(round(float(y)))])
+            except (TypeError, ValueError):
+                continue
+        if len(pts) != 4:
+            return None
+        return pts
+
+    def _build_kie_annotations(
+        self, shapes: list[dict]
+    ) -> tuple[list[dict], dict[str, list[int]]]:
+        annotations: list[dict] = []
+        point_map: dict[str, list[int]] = {}
+        for idx, shape in enumerate(shapes):
+            norm_points = self._normalize_kie_points(shape.get("points"))
+            if not norm_points:
+                raise ValueError("Invalid polygon points found in KIE payload.")
+            text = (shape.get("text") or "").strip()
+            if not text:
+                raise ValueError(
+                    "Recognition results are required before classification."
+                )
+            ann = {
+                "transcription": text,
+                "points": norm_points,
+                "label": "None",
+            }
+            annotations.append(ann)
+            key = self._points_key(norm_points)
+            point_map.setdefault(key, []).append(idx)
+        return annotations, point_map
+
+    def _parse_kie_results(self, result_path: Path) -> dict[str, dict]:
+        predictions: dict[str, dict] = {}
+        lines = result_path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            try:
+                _, payload = line.split("\t", 1)
+            except ValueError:
+                continue
+            try:
+                data = json.loads(payload)
+            except Exception:
+                continue
+            for ann in data.get("ocr_info") or []:
+                norm_points = self._normalize_prediction_points(ann.get("points"))
+                if not norm_points:
+                    continue
+                key = self._points_key(norm_points)
+                label = ann.get("pred") or ann.get("label") or ann.get("key_cls")
+                if not label:
+                    continue
+                try:
+                    score = float(ann.get("score", 0) or 0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                existing = predictions.get(key)
+                if existing is None or score > existing.get("score", 0):
+                    predictions[key] = {"label": label, "score": score}
+        return predictions
+
+    @staticmethod
+    def _sort_kie_annotations(
+        annotations: list[dict], reverse: bool = False
+    ) -> list[dict]:
+        def _key(ann: dict):
+            try:
+                return ann["points"][0][1]
+            except Exception:
+                return 0
+
+        return sorted(annotations, key=_key, reverse=reverse)
+
+    @staticmethod
+    def _kie_token_len(text: str, tokenizer) -> int:
+        if not text:
+            return 0
+        return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def _split_by_token_budget(
+        self,
+        annotations: list[dict],
+        tokenizer,
+        max_seq_len: int,
+        min_token_overlap: int = 0,
+    ) -> list[list[dict]]:
+        if max_seq_len <= 2:
+            raise ValueError("max_seq_len must be > 2")
+        if min_token_overlap < 0:
+            raise ValueError("min_token_overlap must be >= 0")
+
+        tok_counts = [
+            self._kie_token_len(ann.get("transcription", ""), tokenizer)
+            for ann in annotations
+        ]
+        n = len(annotations)
+        if n == 0:
+            return []
+
+        budget = max_seq_len - 2
+        prefix = [0]
+        for t in tok_counts:
+            prefix.append(prefix[-1] + t)
+
+        def range_tokens(i: int, j: int):
+            return prefix[j] - prefix[i]
+
+        out: list[list[dict]] = []
+        start = 0
+        while start < n:
+            end = start
+            while end < n and range_tokens(start, end + 1) <= budget:
+                end += 1
+            if end == start:
+                end = min(start + 1, n)
+
+            out.append(annotations[start:end])
+
+            if end >= n:
+                break
+
+            if min_token_overlap == 0:
+                start = end
+            else:
+                start_prime = start
+                while (
+                    start_prime < end
+                    and range_tokens(start_prime, end) >= min_token_overlap
+                ):
+                    start_prime += 1
+
+                if start_prime == start:
+                    start = end
+                else:
+                    start = max(start_prime - 1, start + 1)
+        return out
 
     @action(detail=True, methods=["post"])
     def ocr_annotations(self, request, pk=None):
@@ -890,13 +1307,7 @@ class OcrImageViewSet(BaseImageViewSet):
         """
         Export and load finetuned OCR models for a project, then set them active.
         """
-        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME
-
-        if TextDetection is None or TextRecognition is None:
-            return Response(
-                {"error": "PaddleOCR modules unavailable. Is the submodule installed?"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME, ACTIVE_KIE_MODEL_NAME
 
         project_id = request.data.get("project_id")
         if not project_id:
@@ -927,10 +1338,10 @@ class OcrImageViewSet(BaseImageViewSet):
         requested_models = request.data.get("models") or ["det", "rec"]
         if not isinstance(requested_models, (list, tuple, set)):
             requested_models = [requested_models]
-        requested_models = [m for m in requested_models if m in ("det", "rec")]
+        requested_models = [m for m in requested_models if m in ("det", "rec", "kie")]
         if not requested_models:
             return Response(
-                {"error": "No valid models provided. Use any of: det, rec."},
+                {"error": "No valid models provided. Use any of: det, rec, kie."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -941,6 +1352,16 @@ class OcrImageViewSet(BaseImageViewSet):
         errors: dict[str, str] = {}
 
         for target in requested_models:
+            if target == "det" and TextDetection is None:
+                errors[target] = (
+                    "PaddleOCR TextDetection unavailable. Is the submodule installed?"
+                )
+                continue
+            if target == "rec" and TextRecognition is None:
+                errors[target] = (
+                    "PaddleOCR TextRecognition unavailable. Is the submodule installed?"
+                )
+                continue
             run_id = runs_map.get(target) if isinstance(runs_map, dict) else None
             checkpoint_type = (
                 checkpoint_map.get(target) if isinstance(checkpoint_map, dict) else None
@@ -963,10 +1384,12 @@ class OcrImageViewSet(BaseImageViewSet):
                     detector = TextDetection(model_dir=str(inference_dir))
                     _DETECTOR_CACHE[model_key] = detector
                     ACTIVE_DET_MODEL_NAME = model_key
-                else:
+                elif target == "rec":
                     recognizer = TextRecognition(model_dir=str(inference_dir))
                     _RECOGNIZER_CACHE[model_key] = recognizer
                     ACTIVE_REC_MODEL_NAME = model_key
+                else:
+                    ACTIVE_KIE_MODEL_NAME = model_key
 
                 loaded[target] = {
                     "model_key": model_key,
@@ -1000,6 +1423,7 @@ class OcrImageViewSet(BaseImageViewSet):
                 "active": {
                     "detect_model": ACTIVE_DET_MODEL_NAME,
                     "recognize_model": ACTIVE_REC_MODEL_NAME,
+                    "classify_model": ACTIVE_KIE_MODEL_NAME,
                 },
             },
             status=status.HTTP_200_OK,
@@ -1008,20 +1432,15 @@ class OcrImageViewSet(BaseImageViewSet):
     @action(detail=False, methods=["post"])
     def configure_models(self, request):
         """
-        Load and set active detect/recognize models. Unload previous active models if changed.
+        Load and set active detect/recognize/classify models. Unload previous active models if changed.
         """
-        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME
-
-        if TextDetection is None or TextRecognition is None:
-            return Response(
-                {"error": "PaddleOCR modules unavailable. Is the submodule installed?"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+        global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME, ACTIVE_KIE_MODEL_NAME
 
         detect_model = request.data.get("detect_model") or ACTIVE_DET_MODEL_NAME
         recognize_model = request.data.get("recognize_model") or ACTIVE_REC_MODEL_NAME
+        classify_model = request.data.get("classify_model") or ACTIVE_KIE_MODEL_NAME
 
-        changed = {"detect": False, "recognize": False}
+        changed = {"detect": False, "recognize": False, "classify": False}
 
         if detect_model != ACTIVE_DET_MODEL_NAME or detect_model not in _DETECTOR_CACHE:
             _DETECTOR_CACHE.pop(ACTIVE_DET_MODEL_NAME, None)
@@ -1056,10 +1475,15 @@ class OcrImageViewSet(BaseImageViewSet):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
+        if classify_model and classify_model != ACTIVE_KIE_MODEL_NAME:
+            ACTIVE_KIE_MODEL_NAME = classify_model
+            changed["classify"] = True
+
         return Response(
             {
                 "detect_model": ACTIVE_DET_MODEL_NAME,
                 "recognize_model": ACTIVE_REC_MODEL_NAME,
+                "classify_model": ACTIVE_KIE_MODEL_NAME,
                 "changed": changed,
             },
             status=status.HTTP_200_OK,

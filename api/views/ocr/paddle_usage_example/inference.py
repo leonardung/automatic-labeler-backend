@@ -107,11 +107,13 @@ def sort_annotations(
 
 
 PADDLE_ROOT = Path(settings.BASE_DIR) / "submodules" / "PaddleOCR"
+SUBMODULE_ROOT = Path(settings.BASE_DIR) / "submodules"
 sys.path.append(str(PADDLE_ROOT))
+sys.path.append(str(SUBMODULE_ROOT))
 
 from PaddleOCR.tools import infer_det, infer_kie_token_ser, program, infer_rec
 from PaddleOCR.tools.infer_det import draw_det_res
-from PaddleOCR.paddleocr import TextRecognition
+from paddleocr import TextRecognition
 from paddlenlp.transformers import LayoutXLMTokenizer, LayoutLMv2Tokenizer
 
 tokenizer = LayoutLMv2Tokenizer.from_pretrained("layoutlmv2-base-uncased")
