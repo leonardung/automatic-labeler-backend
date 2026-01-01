@@ -533,8 +533,10 @@ class OcrImageViewSet(BaseImageViewSet):
                 min_overlap=min_overlap,
             )
         except FileNotFoundError as exc:
+            log.exception("KIE classification missing resource: %s", exc)
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except ValueError as exc:
+            log.exception("KIE classification validation error: %s", exc)
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as exc:  # pragma: no cover - runtime dependency
             log.exception("KIE classification failed for image %s: %s", image.id, exc)
@@ -568,12 +570,23 @@ class OcrImageViewSet(BaseImageViewSet):
             run_id=run_id,
             checkpoint_type=checkpoint_type,
         )
-        config_path = checkpoint_prefix.parent.parent / "config.yml"
-        if not config_path.exists():
-            raise FileNotFoundError(
-                f"Config file not found for trained kie model at {config_path}."
-            )
+        checkpoint_dir = (
+            checkpoint_prefix
+            if checkpoint_prefix.is_dir()
+            else checkpoint_prefix.parent
+        )
 
+        # Locate config.yml near the model directory (common Paddle layout).
+        candidates = [
+            checkpoint_dir / "config.yml",
+            checkpoint_dir.parent / "config.yml",
+            checkpoint_prefix.parent.parent / "config.yml",
+        ]
+        config_path = next((p for p in candidates if p.exists()), None)
+        if not config_path:
+            raise FileNotFoundError("Config file not found for trained kie model.")
+
+        # Prefer class_list from the training dataset location if present.
         class_path = (
             checkpoint_prefix.parent.parent.parent.parent.parent
             / "datasets/kie/train_data/class_list.txt"
@@ -581,8 +594,7 @@ class OcrImageViewSet(BaseImageViewSet):
         if not class_path.exists():
             raise FileNotFoundError(f"Class list not found at {class_path}.")
 
-        font_path = Path("doc/fonts/simfang.ttf")
-        font_path = (PADDLE_ROOT / font_path).resolve()
+        font_path = (PADDLE_ROOT / "doc/fonts/simfang.ttf").resolve()
         if not font_path.exists():
             raise FileNotFoundError(f"Font path not found at {font_path}.")
 
@@ -599,6 +611,7 @@ class OcrImageViewSet(BaseImageViewSet):
         return {
             "config_path": config_path,
             "checkpoint_prefix": checkpoint_prefix,
+            "checkpoint_dir": checkpoint_dir,
             "class_path": class_path,
             "font_path": font_path,
             "categories": categories,
@@ -658,7 +671,7 @@ class OcrImageViewSet(BaseImageViewSet):
                 f"Global.infer_img={label_file.as_posix()}",
                 f"Global.save_res_path={save_dir.as_posix()}",
                 "Global.infer_mode=False",
-                f"Architecture.Backbone.checkpoints={resources['checkpoint_prefix'].as_posix()}",
+                f"Architecture.Backbone.checkpoints={resources['checkpoint_dir'].as_posix()}",
                 "Eval.dataset.data_dir=/",
                 f"Eval.dataset.label_file_list={label_file.as_posix()}",
             ]
