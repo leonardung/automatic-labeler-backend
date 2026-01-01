@@ -697,7 +697,10 @@ class OcrImageViewSet(BaseImageViewSet):
             if not pred:
                 missing.append(idx)
                 continue
-            classified.append({**shape, "category": pred["label"]})
+            label = pred["label"]
+            if isinstance(label, str):
+                label = label.lower()
+            classified.append({**shape, "category": label})
 
         if missing:
             raise ValueError(
@@ -952,6 +955,7 @@ class OcrImageViewSet(BaseImageViewSet):
         classified = []
         for idx, shape in enumerate(shapes):
             category = shape.get("category") or categories[idx % len(categories)]
+            category = category.lower() if isinstance(category, str) else category
             classified.append({**shape, "category": category})
         return classified
 
