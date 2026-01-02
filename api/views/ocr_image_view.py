@@ -457,12 +457,6 @@ class OcrImageViewSet(BaseImageViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if any(not str(shape.get("text") or "").strip() for shape in shapes):
-            return Response(
-                {"error": "Recognition results are required before classification."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         checkpoint_type_raw = (
             request.data.get("checkpoint_type")
             or request.query_params.get("checkpoint_type")
@@ -615,6 +609,17 @@ class OcrImageViewSet(BaseImageViewSet):
             "inference_dir": inference_dir,
         }
 
+    def _canonicalize_kie_category(
+        self, value, categories: list[str] | None
+    ) -> str | None:
+        if not isinstance(value, str):
+            return value
+        cleaned = value.strip()
+        if not cleaned or not categories:
+            return cleaned
+        lookup = {c.lower(): c for c in categories if isinstance(c, str)}
+        return lookup.get(cleaned.lower(), cleaned)
+
     def _run_kie_inference(
         self,
         image_path: str,
@@ -695,9 +700,10 @@ class OcrImageViewSet(BaseImageViewSet):
                 missing.append(idx)
                 continue
             label = pred["label"]
-            if isinstance(label, str):
-                label = label.lower()
-            classified.append({**shape, "category": label})
+            canonical_label = self._canonicalize_kie_category(
+                label, resources.get("categories")
+            )
+            classified.append({**shape, "category": canonical_label})
 
         if missing:
             raise ValueError(
@@ -764,10 +770,6 @@ class OcrImageViewSet(BaseImageViewSet):
             if not norm_points:
                 raise ValueError("Invalid polygon points found in KIE payload.")
             text = (shape.get("text") or "").strip()
-            if not text:
-                raise ValueError(
-                    "Recognition results are required before classification."
-                )
             ann = {
                 "transcription": text,
                 "points": norm_points,
@@ -952,8 +954,8 @@ class OcrImageViewSet(BaseImageViewSet):
         classified = []
         for idx, shape in enumerate(shapes):
             category = shape.get("category") or categories[idx % len(categories)]
-            category = category.lower() if isinstance(category, str) else category
-            classified.append({**shape, "category": category})
+            canonical = self._canonicalize_kie_category(category, categories)
+            classified.append({**shape, "category": canonical})
         return classified
 
     @staticmethod
