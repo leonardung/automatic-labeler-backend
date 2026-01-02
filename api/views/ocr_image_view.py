@@ -433,9 +433,6 @@ class OcrImageViewSet(BaseImageViewSet):
         categories = []
         if image.project.type == "ocr_kie":
             categories = self._resolve_kie_categories(request, image)
-            recognized_payload = self._classify_kie_shapes(
-                recognized_payload, categories
-            )
 
         saved = self._upsert_annotations(image, recognized_payload)
         response_payload = {"shapes": saved}
