@@ -166,3 +166,4 @@ cython_debug/
 media
 ml_models/sam_models/*.pt
 submodules/custom-paddleocr
+*.sqlite3
