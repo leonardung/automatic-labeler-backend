@@ -37,6 +37,9 @@ from paddlenlp.transformers import LayoutLMv2Tokenizer
 
 DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
 DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
+DEFAULT_DET_THRESH = 0.3
+DEFAULT_DET_BOX_THRESH = 0.6
+DEFAULT_DET_UNCLIP_RATIO = 1.5
 _DETECTOR_CACHE: dict[str, TextDetection] = {}
 _RECOGNIZER_CACHE: dict[str, TextRecognition] = {}
 ACTIVE_DET_MODEL_NAME = DEFAULT_DET_MODEL_NAME
@@ -48,6 +51,23 @@ DEFAULT_KIE_MIN_OVERLAP = 64
 _TRAINED_INFERENCE_SUBDIR = "inference"
 _TRAINED_MODEL_KEY = "trained-project-{project_id}-{target}"
 _DATASET_PROGRESS: dict[tuple[int, int], dict] = {}
+
+
+def _parse_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_detection_thresholds(det_config: dict | None) -> tuple[float, float, float]:
+    if not isinstance(det_config, dict):
+        det_config = {}
+    return (
+        _parse_float(det_config.get("thresh"), DEFAULT_DET_THRESH),
+        _parse_float(det_config.get("box_thresh"), DEFAULT_DET_BOX_THRESH),
+        _parse_float(det_config.get("unclip_ratio"), DEFAULT_DET_UNCLIP_RATIO),
+    )
 
 
 def _trained_model_dir(project_id: int | str, target: str) -> Path:
@@ -312,16 +332,24 @@ class OcrImageViewSet(BaseImageViewSet):
             or request.query_params.get("model_name")
             or ACTIVE_DET_MODEL_NAME
         )
-        try:
-            config = image.project.ocr_model_config
-            poly_to_rect_tolerance_ratio = float(config.get("tolerance_ratio"))
-        except (TypeError, ValueError):
+        config = image.project.ocr_model_config
+        if isinstance(config, dict):
+            det_config = config.get("det")
+            poly_to_rect_tolerance_ratio = _parse_float(config.get("tolerance_ratio"), 0.2)
+        else:
+            det_config = None
             poly_to_rect_tolerance_ratio = 0.2
+        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(det_config)
 
         detector = _DETECTOR_CACHE.get(model_name)
         if detector is None:
             try:
-                detector = TextDetection(model_name=model_name)
+                detector = TextDetection(
+                    model_name=model_name,
+                    thresh=det_thresh,
+                    box_thresh=det_box_thresh,
+                    unclip_ratio=det_unclip_ratio,
+                )
                 _DETECTOR_CACHE[model_name] = detector
             except Exception as exc:  # pragma: no cover - runtime dependency
                 log.exception("Failed to initialize PaddleOCR detector: %s", exc)
@@ -1406,6 +1434,11 @@ class OcrImageViewSet(BaseImageViewSet):
         runs_map = request.data.get("runs") or {}
         checkpoint_map = request.data.get("checkpoint_type") or {}
 
+        det_config = None
+        if isinstance(project.ocr_model_config, dict):
+            det_config = project.ocr_model_config.get("det")
+        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(det_config)
+
         loaded: dict[str, dict] = {}
         errors: dict[str, str] = {}
 
@@ -1441,7 +1474,11 @@ class OcrImageViewSet(BaseImageViewSet):
                 trained_name = _trained_model_name(inference_dir)
                 if target == "det":
                     detector = TextDetection(
-                        model_dir=str(inference_dir), model_name=trained_name
+                        model_dir=str(inference_dir),
+                        model_name=trained_name,
+                        thresh=det_thresh,
+                        box_thresh=det_box_thresh,
+                        unclip_ratio=det_unclip_ratio,
                     )
                     _DETECTOR_CACHE[model_key] = detector
                     ACTIVE_DET_MODEL_NAME = model_key
@@ -1534,6 +1571,26 @@ class OcrImageViewSet(BaseImageViewSet):
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
+        det_threshold_config = det_config
+        if det_threshold_config is None and project is not None:
+            project_config = project.ocr_model_config
+            if isinstance(project_config, dict):
+                det_threshold_config = project_config.get("det")
+        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(
+            det_threshold_config
+        )
+
+        detector_needs_reload = False
+        current_detector = _DETECTOR_CACHE.get(detect_model)
+        if current_detector is not None:
+            extra_args = getattr(current_detector, "_extra_init_args", {}) or {}
+            if (
+                extra_args.get("thresh") != det_thresh
+                or extra_args.get("box_thresh") != det_box_thresh
+                or extra_args.get("unclip_ratio") != det_unclip_ratio
+            ):
+                detector_needs_reload = True
+
         changed = {"detect": False, "recognize": False, "classify": False}
 
         if use_trained_det:
@@ -1568,7 +1625,11 @@ class OcrImageViewSet(BaseImageViewSet):
                 )
                 trained_name = _trained_model_name(inference_dir)
                 detector = TextDetection(
-                    model_dir=str(inference_dir), model_name=trained_name
+                    model_dir=str(inference_dir),
+                    model_name=trained_name,
+                    thresh=det_thresh,
+                    box_thresh=det_box_thresh,
+                    unclip_ratio=det_unclip_ratio,
                 )
                 _DETECTOR_CACHE[model_key] = detector
                 if ACTIVE_DET_MODEL_NAME != model_key:
@@ -1588,11 +1649,24 @@ class OcrImageViewSet(BaseImageViewSet):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
         elif (
-            detect_model != ACTIVE_DET_MODEL_NAME or detect_model not in _DETECTOR_CACHE
+            detect_model != ACTIVE_DET_MODEL_NAME
+            or detect_model not in _DETECTOR_CACHE
+            or detector_needs_reload
         ):
             _DETECTOR_CACHE.pop(ACTIVE_DET_MODEL_NAME, None)
             try:
-                _DETECTOR_CACHE[detect_model] = TextDetection(model_name=detect_model)
+                model_name = detect_model
+                model_dir = None
+                if detector_needs_reload and current_detector is not None:
+                    model_name = getattr(current_detector, "_model_name", detect_model)
+                    model_dir = getattr(current_detector, "_model_dir", None)
+                _DETECTOR_CACHE[detect_model] = TextDetection(
+                    model_name=model_name,
+                    model_dir=model_dir,
+                    thresh=det_thresh,
+                    box_thresh=det_box_thresh,
+                    unclip_ratio=det_unclip_ratio,
+                )
                 ACTIVE_DET_MODEL_NAME = detect_model
                 changed["detect"] = True
             except Exception as exc:  # pragma: no cover - runtime dependency
