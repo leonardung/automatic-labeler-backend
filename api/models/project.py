@@ -12,6 +12,7 @@ class Project(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="projects")
     name = models.CharField(max_length=255)
     type = models.CharField(max_length=30, choices=PROJECT_TYPE_CHOICES)
+    ocr_model_config = models.JSONField(default=dict, blank=True)
 
     def __str__(self):
         return f"{self.name} ({self.type})"

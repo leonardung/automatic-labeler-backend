@@ -1318,6 +1318,31 @@ class OcrImageViewSet(BaseImageViewSet):
         print("requests", progress)
         return Response({"project_id": project.id, "progress": progress})
 
+    @action(detail=False, methods=["get"])
+    def model_config(self, request):
+        """
+        Return the saved OCR model configuration for a project.
+        """
+        project_id = request.query_params.get("project_id")
+        if not project_id:
+            return Response(
+                {"error": "project_id is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return Response(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        config = project.ocr_model_config
+        if not isinstance(config, dict) or not config:
+            config = None
+
+        return Response({"project_id": project.id, "config": config})
+
     @action(detail=False, methods=["post"])
     def configure_trained_models(self, request):
         """
@@ -1452,6 +1477,9 @@ class OcrImageViewSet(BaseImageViewSet):
         """
         global ACTIVE_DET_MODEL_NAME, ACTIVE_REC_MODEL_NAME, ACTIVE_KIE_MODEL_NAME
 
+        project_id = request.data.get("project_id")
+        model_config = request.data.get("model_config")
+
         detect_model = request.data.get("detect_model") or ACTIVE_DET_MODEL_NAME
         recognize_model = request.data.get("recognize_model") or ACTIVE_REC_MODEL_NAME
         classify_model = request.data.get("classify_model") or ACTIVE_KIE_MODEL_NAME
@@ -1494,6 +1522,20 @@ class OcrImageViewSet(BaseImageViewSet):
         if classify_model and classify_model != ACTIVE_KIE_MODEL_NAME:
             ACTIVE_KIE_MODEL_NAME = classify_model
             changed["classify"] = True
+
+        if project_id and isinstance(model_config, dict):
+            try:
+                project = Project.objects.get(id=project_id, user=request.user)
+                project.ocr_model_config = model_config
+                project.save(update_fields=["ocr_model_config"])
+            except Project.DoesNotExist:
+                pass
+            except Exception as exc:  # pragma: no cover - database
+                log.exception(
+                    "Failed to persist OCR model config for project %s: %s",
+                    project_id,
+                    exc,
+                )
 
         return Response(
             {
