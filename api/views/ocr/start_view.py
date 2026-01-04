@@ -198,6 +198,22 @@ class OcrTrainingStartView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        resume_payload = payload.get("resume") or {}
+        resume_settings = _normalize_resume_payload(resume_payload, valid_targets)
+        resume_checkpoints: dict[str, str] = {}
+        if resume_settings:
+            resume_checkpoints, resume_errors = _resolve_resume_checkpoints(
+                project, resume_settings
+            )
+            if resume_errors:
+                return JsonResponse(
+                    {
+                        "error": "Unable to resume from the requested checkpoint.",
+                        "details": resume_errors,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         job_id = uuid.uuid4().hex
         job_log_dir = _ensure_dir(Path(settings.MEDIA_ROOT) / "logs" / "training")
         job = helper.TrainingJob(
@@ -214,7 +230,10 @@ class OcrTrainingStartView(APIView):
         }
 
         _persist_training_config(request.user, project, config)
-        _enqueue_job(job, config)
+        job_config = dict(config)
+        if resume_checkpoints:
+            job_config["resume"] = resume_checkpoints
+        _enqueue_job(job, job_config)
 
         return JsonResponse(
             {"job": helper._serialize_job(job)}, status=status.HTTP_202_ACCEPTED
@@ -254,6 +273,80 @@ def _normalize_training_config(config: Optional[dict]) -> dict:
         models_cfg = {}
     normalized["models"] = models_cfg
     return normalized
+
+
+def _normalize_resume_payload(
+    resume: Any, valid_targets: Iterable[str]
+) -> dict[str, dict]:
+    if not isinstance(resume, dict):
+        return {}
+    normalized: dict[str, dict] = {}
+    for target in valid_targets:
+        entry = resume.get(target)
+        if not entry:
+            continue
+        if isinstance(entry, str):
+            normalized[target] = {"run_id": entry, "checkpoint_type": "latest"}
+            continue
+        if isinstance(entry, dict):
+            run_id = entry.get("run_id") or entry.get("id") or entry.get("run")
+            if not run_id:
+                continue
+            checkpoint_type = entry.get("checkpoint_type") or entry.get(
+                "checkpoint"
+            )
+            normalized[target] = {
+                "run_id": str(run_id),
+                "checkpoint_type": checkpoint_type or "latest",
+            }
+    return normalized
+
+
+def _resolve_resume_checkpoints(
+    project: Project, resume_map: dict[str, dict]
+) -> tuple[dict[str, str], list[str]]:
+    resolved: dict[str, str] = {}
+    errors: list[str] = []
+    for target, entry in resume_map.items():
+        run_id = entry.get("run_id") if isinstance(entry, dict) else None
+        if not run_id:
+            errors.append(f"Missing run_id for target {target}.")
+            continue
+        checkpoint_type = str(entry.get("checkpoint_type") or "latest").lower()
+        if checkpoint_type not in ("best", "latest"):
+            checkpoint_type = "latest"
+        try:
+            run = TrainingRun.objects.get(id=run_id, project=project)
+        except TrainingRun.DoesNotExist:
+            errors.append(f"Run {run_id} not found for target {target}.")
+            continue
+        if run.target != target:
+            errors.append(f"Run {run_id} does not match target {target}.")
+            continue
+        models_dir = Path(run.models_dir) if run.models_dir else None
+        prefix = None
+        run_checkpoint = (
+            run.best_checkpoint
+            if checkpoint_type == "best"
+            else run.latest_checkpoint
+        )
+        if run_checkpoint:
+            candidate = Path(run_checkpoint)
+            if candidate.suffix == ".pdparams":
+                candidate = candidate.with_suffix("")
+            if candidate.with_suffix(".pdparams").exists():
+                prefix = candidate
+        if not prefix and models_dir:
+            prefix = _checkpoint_prefix(
+                models_dir, prefer_best=checkpoint_type == "best"
+            )
+        if not prefix or not prefix.with_suffix(".pdparams").exists():
+            errors.append(
+                f"No {checkpoint_type} checkpoint found for {target} run {run_id}."
+            )
+            continue
+        resolved[target] = prefix.as_posix()
+    return resolved, errors
 
 
 def _persist_training_config(user, project: Project, config: dict):
@@ -509,6 +602,9 @@ def _run_training(job: helper.TrainingJob):
         config = job.config_raw or {}
         global_cfg = _extract_global_cfg(config)
         overrides = config.get("models") or {}
+        resume_checkpoints = (
+            config.get("resume") if isinstance(config.get("resume"), dict) else {}
+        )
         config_for_dataset = dict(config)
         for key, value in global_cfg.items():
             config_for_dataset.setdefault(key, value)
@@ -551,6 +647,13 @@ def _run_training(job: helper.TrainingJob):
                     )
                     run = _create_training_run(project, job, target, models_dir)
                     runs_by_target[target] = run
+                resume_checkpoint = (
+                    resume_checkpoints.get(target) if resume_checkpoints else None
+                )
+                if resume_checkpoint:
+                    job.append_log(
+                        f"[{target}] Resuming from checkpoint {resume_checkpoint}\n"
+                    )
                 _train_model(
                     target,
                     project,
@@ -559,6 +662,7 @@ def _run_training(job: helper.TrainingJob):
                     overrides,
                     job,
                     run=run,
+                    resume_checkpoint=resume_checkpoint,
                 )
             except TrainingCancelled:
                 success = False
@@ -916,6 +1020,7 @@ def _train_model(
     overrides: dict,
     job: helper.TrainingJob,
     run: Optional[TrainingRun] = None,
+    resume_checkpoint: Optional[str] = None,
 ):
     _check_stop(job)
     cfg_path = {
@@ -1017,6 +1122,17 @@ def _train_model(
                 "Train.loader.batch_size_per_card=1",
             ]
         )
+
+    if resume_checkpoint:
+        resume_path = Path(str(resume_checkpoint))
+        if resume_path.suffix == ".pdparams":
+            resume_path = resume_path.with_suffix("")
+        checkpoint_file = resume_path.with_suffix(".pdparams")
+        if not checkpoint_file.exists():
+            raise RuntimeError(
+                f"Resume checkpoint not found at {checkpoint_file}."
+            )
+        overrides_list.append(f"Global.checkpoints={resume_path.as_posix()}")
 
     model_overrides = overrides.get(target) or {}
     model_overrides = {**model_overrides, "save_epoch_step": 100000000}
