@@ -45,6 +45,7 @@ class TrainingRun(models.Model):
     )
     target = models.CharField(max_length=8, choices=TARGET_CHOICES)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="pending")
+    name = models.CharField(max_length=128, blank=True, default="")
     models_dir = models.CharField(max_length=512, blank=True)
     best_checkpoint = models.CharField(max_length=512, blank=True)
     latest_checkpoint = models.CharField(max_length=512, blank=True)

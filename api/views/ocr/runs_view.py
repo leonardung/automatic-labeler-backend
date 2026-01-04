@@ -58,6 +58,7 @@ def _serialize_run(run: TrainingRun) -> dict:
         "project_id": run.project_id,
         "target": run.target,
         "status": run.status,
+        "name": run.name,
         "models_dir": run.models_dir,
         "best_checkpoint": best_checkpoint,
         "latest_checkpoint": latest_checkpoint,
@@ -101,6 +102,48 @@ class OcrTrainingRunListView(APIView):
 
         runs = [_serialize_run(run) for run in runs_qs.order_by("-created_at")[:200]]
         return JsonResponse({"runs": runs}, status=status.HTTP_200_OK)
+
+    def patch(self, request):
+        project_id = request.data.get("project_id") or request.query_params.get("project_id")
+        run_id = request.data.get("run_id") or request.query_params.get("run_id")
+        name = request.data.get("name") if hasattr(request, "data") else None
+        if name is None:
+            name = request.query_params.get("name")
+        if not project_id or not run_id:
+            return JsonResponse(
+                {"error": "project_id and run_id are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if name is None:
+            return JsonResponse(
+                {"error": "name is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            project = Project.objects.get(id=project_id, user=request.user)
+        except Project.DoesNotExist:
+            return JsonResponse(
+                {"error": "Project not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            run = TrainingRun.objects.get(id=run_id, project=project)
+        except TrainingRun.DoesNotExist:
+            return JsonResponse(
+                {"error": "Run not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        name_value = str(name).strip()
+        if len(name_value) > 128:
+            return JsonResponse(
+                {"error": "name must be 128 characters or fewer."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        run.name = name_value
+        run.save(update_fields=["name"])
+        return JsonResponse({"run": _serialize_run(run)}, status=status.HTTP_200_OK)
 
     def delete(self, request):
         project_id = request.data.get("project_id") or request.query_params.get("project_id")
