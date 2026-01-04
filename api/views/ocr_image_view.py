@@ -312,22 +312,11 @@ class OcrImageViewSet(BaseImageViewSet):
             or request.query_params.get("model_name")
             or ACTIVE_DET_MODEL_NAME
         )
-        score_threshold_raw = request.data.get(
-            "score_threshold"
-        ) or request.query_params.get("score_threshold")
         try:
-            score_threshold = (
-                float(score_threshold_raw) if score_threshold_raw is not None else 0.3
-            )
+            config = image.project.ocr_model_config
+            poly_to_rect_tolerance_ratio = float(config.get("tolerance_ratio"))
         except (TypeError, ValueError):
-            score_threshold = 0.3
-        tolerance_raw = request.data.get("tolerance_ratio") or request.query_params.get(
-            "tolerance_ratio"
-        )
-        try:
-            tolerance_ratio = float(tolerance_raw) if tolerance_raw is not None else 0
-        except (TypeError, ValueError):
-            tolerance_ratio = 0.2
+            poly_to_rect_tolerance_ratio = 0.2
 
         detector = _DETECTOR_CACHE.get(model_name)
         if detector is None:
@@ -354,14 +343,10 @@ class OcrImageViewSet(BaseImageViewSet):
         if output:
             result = output[0]
             polys = result.get("dt_polys", [])
-            scores = result.get("dt_scores", [])
-            for idx, poly in enumerate(polys):
-                score = scores[idx] if idx < len(scores) else None
-                if score is not None and score < score_threshold:
-                    continue
+            for poly in polys:
                 points = [{"x": int(pt[0]), "y": int(pt[1])} for pt in poly]
                 rect_points = self._polygon_to_rect(
-                    points, tolerance_ratio=tolerance_ratio
+                    points, tolerance_ratio=poly_to_rect_tolerance_ratio
                 )
                 shapes.append(
                     {
