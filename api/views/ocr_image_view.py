@@ -36,7 +36,7 @@ from PaddleOCR.tools import infer_kie_token_ser, program
 from paddlenlp.transformers import LayoutLMv2Tokenizer
 
 DEFAULT_DET_MODEL_NAME = "PP-OCRv5_server_det"
-DEFAULT_REC_MODEL_NAME = "PP-OCRv5_server_rec"
+DEFAULT_REC_MODEL_NAME = "latin_PP-OCRv5_mobile_rec"
 DEFAULT_DET_THRESH = 0.3
 DEFAULT_DET_BOX_THRESH = 0.6
 DEFAULT_DET_UNCLIP_RATIO = 1.5
@@ -335,11 +335,15 @@ class OcrImageViewSet(BaseImageViewSet):
         config = image.project.ocr_model_config
         if isinstance(config, dict):
             det_config = config.get("det")
-            poly_to_rect_tolerance_ratio = _parse_float(config.get("tolerance_ratio"), 0.2)
+            poly_to_rect_tolerance_ratio = _parse_float(
+                config.get("tolerance_ratio"), 0.2
+            )
         else:
             det_config = None
             poly_to_rect_tolerance_ratio = 0.2
-        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(det_config)
+        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(
+            det_config
+        )
 
         detector = _DETECTOR_CACHE.get(model_name)
         if detector is None:
@@ -1437,7 +1441,9 @@ class OcrImageViewSet(BaseImageViewSet):
         det_config = None
         if isinstance(project.ocr_model_config, dict):
             det_config = project.ocr_model_config.get("det")
-        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(det_config)
+        det_thresh, det_box_thresh, det_unclip_ratio = _get_detection_thresholds(
+            det_config
+        )
 
         loaded: dict[str, dict] = {}
         errors: dict[str, str] = {}
