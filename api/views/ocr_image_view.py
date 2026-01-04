@@ -158,6 +158,38 @@ def _has_inference_files(inference_dir: Path) -> bool:
     return has_model_file and has_params
 
 
+def _read_model_name_from_config(config_path: Path) -> str | None:
+    if not config_path.exists():
+        return None
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    global_cfg = payload.get("Global") or payload.get("global")
+    if not isinstance(global_cfg, dict):
+        return None
+    model_name = global_cfg.get("model_name")
+    if isinstance(model_name, str) and model_name.strip():
+        return model_name.strip()
+    return None
+
+
+def _trained_model_name(inference_dir: Path) -> str | None:
+    candidates = [
+        inference_dir / "inference.yml",
+        inference_dir / "inference.yaml",
+        inference_dir.parent / "config.yml",
+        inference_dir.parent / "config.yaml",
+    ]
+    for candidate in candidates:
+        model_name = _read_model_name_from_config(candidate)
+        if model_name:
+            return model_name
+    return None
+
+
 def _export_trained_model(
     project_id: int | str,
     target: str,
@@ -190,7 +222,7 @@ def _export_trained_model(
             f"No trained {target} model directory found for project {project_id}."
         )
 
-    config_path = models_dir.parent / "kie/config.yml"
+    config_path = models_dir / "config.yml"
     if not config_path.exists():
         raise FileNotFoundError(
             f"Config file not found for trained {target} model at {config_path}."
@@ -1421,12 +1453,17 @@ class OcrImageViewSet(BaseImageViewSet):
                     project_id=project.id,
                     target=f"{target}-{run_used.id if run_used else 'latest'}",
                 )
+                trained_name = _trained_model_name(inference_dir)
                 if target == "det":
-                    detector = TextDetection(model_dir=str(inference_dir))
+                    detector = TextDetection(
+                        model_dir=str(inference_dir), model_name=trained_name
+                    )
                     _DETECTOR_CACHE[model_key] = detector
                     ACTIVE_DET_MODEL_NAME = model_key
                 elif target == "rec":
-                    recognizer = TextRecognition(model_dir=str(inference_dir))
+                    recognizer = TextRecognition(
+                        model_dir=str(inference_dir), model_name=trained_name
+                    )
                     _RECOGNIZER_CACHE[model_key] = recognizer
                     ACTIVE_REC_MODEL_NAME = model_key
                 else:
@@ -1484,9 +1521,90 @@ class OcrImageViewSet(BaseImageViewSet):
         recognize_model = request.data.get("recognize_model") or ACTIVE_REC_MODEL_NAME
         classify_model = request.data.get("classify_model") or ACTIVE_KIE_MODEL_NAME
 
+        det_config = model_config.get("det") if isinstance(model_config, dict) else None
+        rec_config = model_config.get("rec") if isinstance(model_config, dict) else None
+        use_trained_det = (
+            isinstance(det_config, dict) and det_config.get("source") == "finetuned"
+        )
+        use_trained_rec = (
+            isinstance(rec_config, dict) and rec_config.get("source") == "finetuned"
+        )
+
+        project = None
+        if project_id:
+            try:
+                project = Project.objects.get(id=project_id, user=request.user)
+            except Project.DoesNotExist:
+                project = None
+
+        if use_trained_det or use_trained_rec:
+            if not project_id:
+                return Response(
+                    {"error": "project_id is required for finetuned models."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not project:
+                return Response(
+                    {"error": "Project not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
         changed = {"detect": False, "recognize": False, "classify": False}
 
-        if detect_model != ACTIVE_DET_MODEL_NAME or detect_model not in _DETECTOR_CACHE:
+        if use_trained_det:
+            if TextDetection is None:
+                return Response(
+                    {
+                        "error": "PaddleOCR TextDetection unavailable. Is the submodule installed?"
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            det_run_id = (
+                det_config.get("run_id") if isinstance(det_config, dict) else None
+            )
+            det_checkpoint = (
+                det_config.get("checkpoint_type")
+                if isinstance(det_config, dict)
+                else None
+            )
+            det_checkpoint = (det_checkpoint or "best").lower()
+            if det_checkpoint not in ("best", "latest"):
+                det_checkpoint = "best"
+            try:
+                inference_dir, _, run_used = _export_trained_model(
+                    project.id,
+                    "det",
+                    run_id=det_run_id,
+                    checkpoint_type=det_checkpoint,
+                )
+                model_key = _TRAINED_MODEL_KEY.format(
+                    project_id=project.id,
+                    target=f"det-{run_used.id if run_used else 'latest'}",
+                )
+                trained_name = _trained_model_name(inference_dir)
+                detector = TextDetection(
+                    model_dir=str(inference_dir), model_name=trained_name
+                )
+                _DETECTOR_CACHE[model_key] = detector
+                if ACTIVE_DET_MODEL_NAME != model_key:
+                    _DETECTOR_CACHE.pop(ACTIVE_DET_MODEL_NAME, None)
+                ACTIVE_DET_MODEL_NAME = model_key
+                detect_model = model_key
+                changed["detect"] = True
+            except FileNotFoundError as exc:
+                return Response(
+                    {"error": str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception("Failed to load trained detect model: %s", exc)
+                return Response(
+                    {"error": "Failed to load trained detect model."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        elif (
+            detect_model != ACTIVE_DET_MODEL_NAME or detect_model not in _DETECTOR_CACHE
+        ):
             _DETECTOR_CACHE.pop(ACTIVE_DET_MODEL_NAME, None)
             try:
                 _DETECTOR_CACHE[detect_model] = TextDetection(model_name=detect_model)
@@ -1499,7 +1617,58 @@ class OcrImageViewSet(BaseImageViewSet):
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
 
-        if (
+        if use_trained_rec:
+            if TextRecognition is None:
+                return Response(
+                    {
+                        "error": "PaddleOCR TextRecognition unavailable. Is the submodule installed?"
+                    },
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            rec_run_id = (
+                rec_config.get("run_id") if isinstance(rec_config, dict) else None
+            )
+            rec_checkpoint = (
+                rec_config.get("checkpoint_type")
+                if isinstance(rec_config, dict)
+                else None
+            )
+            rec_checkpoint = (rec_checkpoint or "best").lower()
+            if rec_checkpoint not in ("best", "latest"):
+                rec_checkpoint = "best"
+            try:
+                inference_dir, _, run_used = _export_trained_model(
+                    project.id,
+                    "rec",
+                    run_id=rec_run_id,
+                    checkpoint_type=rec_checkpoint,
+                )
+                model_key = _TRAINED_MODEL_KEY.format(
+                    project_id=project.id,
+                    target=f"rec-{run_used.id if run_used else 'latest'}",
+                )
+                trained_name = _trained_model_name(inference_dir)
+                recognizer = TextRecognition(
+                    model_dir=str(inference_dir), model_name=trained_name
+                )
+                _RECOGNIZER_CACHE[model_key] = recognizer
+                if ACTIVE_REC_MODEL_NAME != model_key:
+                    _RECOGNIZER_CACHE.pop(ACTIVE_REC_MODEL_NAME, None)
+                ACTIVE_REC_MODEL_NAME = model_key
+                recognize_model = model_key
+                changed["recognize"] = True
+            except FileNotFoundError as exc:
+                return Response(
+                    {"error": str(exc)},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            except Exception as exc:  # pragma: no cover - runtime dependency
+                log.exception("Failed to load trained recognize model: %s", exc)
+                return Response(
+                    {"error": "Failed to load trained recognize model."},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+        elif (
             recognize_model != ACTIVE_REC_MODEL_NAME
             or recognize_model not in _RECOGNIZER_CACHE
         ):
@@ -1525,7 +1694,8 @@ class OcrImageViewSet(BaseImageViewSet):
 
         if project_id and isinstance(model_config, dict):
             try:
-                project = Project.objects.get(id=project_id, user=request.user)
+                if project is None:
+                    project = Project.objects.get(id=project_id, user=request.user)
                 project.ocr_model_config = model_config
                 project.save(update_fields=["ocr_model_config"])
             except Project.DoesNotExist:
