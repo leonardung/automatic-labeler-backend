@@ -1,0 +1,10 @@
+# GPU Requirements for Local Development
+# Install with: pip install -r requirements_gpu.txt
+
+# PyTorch with CUDA 12.1 support
+--index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+
+# All other requirements (after installing PyTorch)
+-r requirements.txt

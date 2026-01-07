@@ -34,7 +34,13 @@ call venv\Scripts\activate.bat
 
 REM Install dependencies
 echo Installing dependencies...
-pip install -r requirements.txt
+if exist requirements_gpu.txt (
+    echo Installing GPU-enabled dependencies...
+    pip install -r requirements_gpu.txt
+) else (
+    echo Installing CPU-only dependencies...
+    pip install -r requirements.txt
+)
 
 REM Run migrations
 echo Running database migrations...

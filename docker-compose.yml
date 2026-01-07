@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: development
+      target: ${DOCKER_TARGET:-development-gpu}
     container_name: automatic-labeler-backend
     volumes:
       - .:/app
@@ -28,11 +28,20 @@ services:
       - REDIS_DB=${REDIS_DB:-0}
       - JWT_ACCESS_TOKEN_LIFETIME_MINUTES=${JWT_ACCESS_TOKEN_LIFETIME_MINUTES:-60}
       - JWT_REFRESH_TOKEN_LIFETIME_DAYS=${JWT_REFRESH_TOKEN_LIFETIME_DAYS:-1}
+      - USE_GPU=${USE_GPU:-true}
     depends_on:
       - redis
     networks:
       - app-network
     restart: unless-stopped
+    # GPU configuration - requires nvidia-docker2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
   redis:
     image: redis:7-alpine

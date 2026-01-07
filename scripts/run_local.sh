@@ -33,7 +33,13 @@ source venv/bin/activate
 
 # Install dependencies
 echo "Installing dependencies..."
-pip install -r requirements.txt
+if [ -f requirements_gpu.txt ]; then
+    echo "Installing GPU-enabled dependencies..."
+    pip install -r requirements_gpu.txt
+else
+    echo "Installing CPU-only dependencies..."
+    pip install -r requirements.txt
+fi
 
 # Run migrations
 echo "Running database migrations..."
