@@ -43,8 +43,13 @@ WORKDIR /app
 # Install Python and system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && \
+    apt-get install -y --no-install-recommends \
     python3.12 \
     python3.12-dev \
+    python3.12-venv \
     python3-pip \
     ffmpeg \
     libsm6 \
@@ -52,8 +57,11 @@ RUN apt-get update && \
     git \
     build-essential \
     curl \
-    && ln -s /usr/bin/python3.12 /usr/bin/python && \
-    rm -rf /var/lib/apt/lists/*
+    wget \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
+    && rm -rf /var/lib/apt/lists/*
 
 # ============================================
 # Development CPU stage
