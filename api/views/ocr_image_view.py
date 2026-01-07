@@ -1781,3 +1781,80 @@ class OcrImageViewSet(BaseImageViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @action(detail=False, methods=["post"])
+    def bulk_update_validation(self, request):
+        """
+        Bulk update is_label field for multiple images.
+
+        Request body:
+        {
+            "image_ids": [1, 2, 3, ...],
+            "is_label": true/false
+        }
+        """
+        image_ids = request.data.get("image_ids", [])
+        is_label = request.data.get("is_label")
+
+        if not isinstance(image_ids, list) or not image_ids:
+            return Response(
+                {"error": "image_ids must be a non-empty list."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not isinstance(is_label, bool):
+            return Response(
+                {"error": "is_label must be a boolean."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Filter to only images the user owns and of the correct project type
+        queryset = self.get_queryset().filter(id__in=image_ids)
+        updated_count = queryset.update(is_label=is_label)
+
+        # Get the updated images to return
+        updated_images = queryset.all()
+        serializer = self.get_serializer(updated_images, many=True)
+
+        return Response(
+            {
+                "updated_count": updated_count,
+                "images": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"])
+    def bulk_clear_annotations(self, request):
+        """
+        Bulk clear OCR annotations for multiple images.
+
+        Request body:
+        {
+            "image_ids": [1, 2, 3, ...]
+        }
+        """
+        image_ids = request.data.get("image_ids", [])
+
+        if not isinstance(image_ids, list) or not image_ids:
+            return Response(
+                {"error": "image_ids must be a non-empty list."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Filter to only images the user owns and of the correct project type
+        queryset = self.get_queryset().filter(id__in=image_ids)
+
+        # Delete all OCR annotations for these images
+        deleted_count = 0
+        for image in queryset:
+            count, _ = OcrAnnotation.objects.filter(image=image).delete()
+            deleted_count += count
+
+        return Response(
+            {
+                "deleted_count": deleted_count,
+                "cleared_image_count": queryset.count(),
+            },
+            status=status.HTTP_200_OK,
+        )
