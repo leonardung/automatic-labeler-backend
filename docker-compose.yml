@@ -12,7 +12,7 @@ services:
       - media_data:/app/media
       - static_data:/app/staticfiles
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:8000"
     environment:
       - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-django-insecure-docker-dev-key}
       - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
@@ -29,6 +29,7 @@ services:
       - JWT_ACCESS_TOKEN_LIFETIME_MINUTES=${JWT_ACCESS_TOKEN_LIFETIME_MINUTES:-60}
       - JWT_REFRESH_TOKEN_LIFETIME_DAYS=${JWT_REFRESH_TOKEN_LIFETIME_DAYS:-1}
       - USE_GPU=${USE_GPU:-true}
+      - PORT=${PORT:-8000}
     depends_on:
       - redis
     networks:
