@@ -1,21 +1,56 @@
 version: '3.8'
 
 services:
-  # django:
-  #   build: .
-  #   volumes:
-  #     - .:/app
-  #   ports:
-  #     - "8000:8000"
-  #   depends_on:
-  #     - redis
-  #   environment:
-  #     - DJANGO_SETTINGS_MODULE=image_labeling_backend.settings
-  #   command: >
-  #     sh -c "python manage.py migrate &&
-  #            daphne -b 0.0.0.0 -p 8000 image_labeling_backend.asgi:application"
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: automatic-labeler-backend
+    volumes:
+      - .:/app
+      - media_data:/app/media
+      - static_data:/app/staticfiles
+    ports:
+      - "8000:8000"
+    environment:
+      - DJANGO_SECRET_KEY=${DJANGO_SECRET_KEY:-django-insecure-docker-dev-key}
+      - DJANGO_DEBUG=${DJANGO_DEBUG:-True}
+      - DJANGO_ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+      - DATABASE_ENGINE=${DATABASE_ENGINE:-django.db.backends.sqlite3}
+      - DATABASE_NAME=${DATABASE_NAME:-db.sqlite3}
+      - MEDIA_STORAGE_BACKEND=${MEDIA_STORAGE_BACKEND:-local}
+      - MEDIA_ROOT=${MEDIA_ROOT:-/app/media}
+      - MEDIA_URL=${MEDIA_URL:-/media/}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      - JWT_ACCESS_TOKEN_LIFETIME_MINUTES=${JWT_ACCESS_TOKEN_LIFETIME_MINUTES:-60}
+      - JWT_REFRESH_TOKEN_LIFETIME_DAYS=${JWT_REFRESH_TOKEN_LIFETIME_DAYS:-1}
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
 
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
+    container_name: automatic-labeler-redis
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+volumes:
+  media_data:
+  static_data:
+  redis_data:
+
+networks:
+  app-network:
+    driver: bridge
