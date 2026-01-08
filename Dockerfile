@@ -21,6 +21,7 @@ RUN apt-get update && \
     libxext6 \
     git \
     build-essential \
+    cmake \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,11 +52,13 @@ RUN apt-get update && \
     python3.12-dev \
     python3.12-venv \
     python3-pip \
+    python3-setuptools \
     ffmpeg \
     libsm6 \
     libxext6 \
     git \
     build-essential \
+    cmake \
     curl \
     wget \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
@@ -72,16 +75,20 @@ FROM base-cpu as development-cpu
 # ARG TORCHVISION_VERSION=0.20.1
 # ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 
-# RUN pip install --no-cache-dir --upgrade pip && \
-#     pip install --no-cache-dir torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+# RUN pip install --upgrade pip && \
+#     pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
 
-RUN pip install --no-cache-dir --upgrade pip && \
+RUN pip install --upgrade pip && \
     pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 
 # Copy application code
 COPY . .
-RUN pip install --no-cache-dir -r submodules/PaddleOCR/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+
+
+RUN pip install -r submodules/PaddleOCR/requirements.txt
+
+RUN pip install -r requirements.txt
+
 EXPOSE 8000
 
 CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"]
@@ -95,15 +102,17 @@ FROM base-gpu as development-gpu
 # ARG TORCHVISION_VERSION=0.20.1
 # ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
 
-# RUN pip install --no-cache-dir --upgrade pip && \
-#     pip install --no-cache-dir torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
-RUN pip install --no-cache-dir --upgrade pip && \
+# RUN pip install --upgrade pip && \
+#     pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+RUN pip install --upgrade pip && \
     pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
 # Copy application code
 COPY . .
-RUN pip install --no-cache-dir -r submodules/PaddleOCR/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+
+RUN pip install -r submodules/PaddleOCR/requirements.txt
+
+RUN pip install -r requirements_no_version.txt
 
 EXPOSE 8000
 
@@ -122,12 +131,12 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+RUN pip install --upgrade pip && \
+    pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir gunicorn==21.2.0
+RUN pip install -r requirements.txt && \
+    pip install gunicorn==21.2.0
 
 # Copy application code
 COPY --chown=appuser:appuser . .
@@ -157,12 +166,12 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 # Install Python dependencies with CUDA support
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+RUN pip install --upgrade pip && \
+    pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir gunicorn==21.2.0
+RUN pip install -r requirements.txt && \
+    pip install gunicorn==21.2.0
 
 # Copy application code
 COPY --chown=appuser:appuser . .
