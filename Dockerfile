@@ -71,19 +71,15 @@ RUN apt-get update && \
 # ============================================
 FROM base-cpu as development-cpu
 
-# ARG TORCH_VERSION=2.5.1
-# ARG TORCHVISION_VERSION=0.20.1
-# ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
-
-# RUN pip install --upgrade pip && \
-#     pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --upgrade pip && \
     pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 
 # Copy application code
 COPY . .
-
 
 RUN pip install -r submodules/PaddleOCR/requirements.txt
 
@@ -98,12 +94,10 @@ CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0
 # ============================================
 FROM base-gpu as development-gpu
 
-# ARG TORCH_VERSION=2.5.1
-# ARG TORCHVISION_VERSION=0.20.1
-# ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# RUN pip install --upgrade pip && \
-#     pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
 RUN pip install --upgrade pip && \
     pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
@@ -123,27 +117,30 @@ CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0
 # ============================================
 FROM base-cpu as production-cpu
 
-ARG TORCH_VERSION=2.5.1
-ARG TORCHVISION_VERSION=0.20.1
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 # Install Python dependencies
 RUN pip install --upgrade pip && \
-    pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
+    pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+# Copy application code
+COPY . .
+
+RUN pip install -r submodules/PaddleOCR/requirements.txt
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt && \
     pip install gunicorn==21.2.0
 
-# Copy application code
-COPY --chown=appuser:appuser . .
-
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/media /app/staticfiles && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /opt/venv
 
 # Switch to non-root user
 USER appuser
@@ -158,27 +155,30 @@ CMD ["sh", "-c", "python manage.py collectstatic --noinput && python manage.py m
 # ============================================
 FROM base-gpu as production-gpu
 
-ARG TORCH_VERSION=2.5.1
-ARG TORCHVISION_VERSION=0.20.1
-ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 # Install Python dependencies with CUDA support
 RUN pip install --upgrade pip && \
-    pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_INDEX_URL}
-
-COPY requirements.txt .
-RUN pip install -r requirements.txt && \
-    pip install gunicorn==21.2.0
+    pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
 # Copy application code
-COPY --chown=appuser:appuser . .
+COPY . .
+
+RUN pip install -r submodules/PaddleOCR/requirements.txt
+
+COPY requirements_no_version.txt .
+RUN pip install -r requirements_no_version.txt && \
+    pip install gunicorn==21.2.0
 
 # Create necessary directories with proper permissions
 RUN mkdir -p /app/media /app/staticfiles && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /opt/venv
 
 # Switch to non-root user
 USER appuser
