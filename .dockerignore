@@ -88,8 +88,15 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 
-# Submodules (keep compiled but ignore source)
-submodules/
+# Submodules (keep requirements.txt and necessary files, ignore git and docs)
+submodules/**/.git
+submodules/**/docs/
+submodules/**/doc/
+submodules/**/tests/
+submodules/**/test_tipc/
+submodules/**/.github/
+submodules/**/*.md
+submodules/**/benchmark/
 
 # Scripts (if not needed in container)
 scripts/run_local.*
