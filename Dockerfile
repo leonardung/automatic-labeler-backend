@@ -65,7 +65,7 @@ COPY . .
 
 # Install PaddleOCR and other dependencies
 RUN pip install --upgrade pip && \
-    pip install -r submodules/PaddleOCR/requirements.txt && \
+    pip install --ignore-installed -r submodules/PaddleOCR/requirements.txt && \
     pip install -r requirements.txt
 
 EXPOSE 8000
@@ -83,9 +83,19 @@ FROM base-gpu as development-gpu
 COPY . .
 
 # Install PaddleOCR and other dependencies
-RUN pip install --upgrade pip && \
-    pip install -r submodules/PaddleOCR/requirements.txt && \
-    pip install -r requirements_no_version.txt
+RUN pip install --upgrade pip
+
+# Install compatible numpy/scipy versions that work with sklearn and PaddlePaddle
+RUN pip install numpy==1.26.4 scipy==1.11.4
+
+# Install PaddleOCR requirements
+RUN pip install --ignore-installed -r submodules/PaddleOCR/requirements.txt || true
+
+# Ensure we keep the correct numpy version (PaddleOCR might try to change it)
+RUN pip install --force-reinstall --no-deps numpy==1.26.4
+
+# Install other requirements
+RUN pip install -r requirements_no_version.txt
 
 EXPOSE 8000
 
