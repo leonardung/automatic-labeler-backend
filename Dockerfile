@@ -1,8 +1,10 @@
-# Multi-stage build for production-ready backend with GPU support
+# Django Backend Dockerfile WITHOUT PaddleOCR
+# PaddleOCR operations are now handled by the GPU microservice
+
 # ============================================
-# Base CPU stage - Using official PaddlePaddle image
+# Base stage
 # ============================================
-FROM paddlepaddle/paddle:3.0.0 as base-cpu
+FROM python:3.12-slim as base
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -13,158 +15,77 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install additional system dependencies needed for the application
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    curl \
     ffmpeg \
     libsm6 \
     libxext6 \
+    libxrender-dev \
+    libgl1 \
+    libglib2.0-0 \
     git \
     build-essential \
-    cmake \
-    curl \
-    wget \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# Base GPU stage - Using official PaddlePaddle image
+# Development stage
 # ============================================
-FROM paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6 as base-gpu
+FROM base as development
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
+# Copy requirements
+COPY requirements.txt .
 
-WORKDIR /app
-
-# Install additional system dependencies needed for the application
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    ffmpeg \
-    libsm6 \
-    libxext6 \
-    git \
-    build-essential \
-    cmake \
-    curl \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
-# ============================================
-# Development CPU stage
-# ============================================
-FROM base-cpu as development-cpu
-
-# PaddlePaddle CPU is already installed in the base image
-
-# Copy application code
-COPY . .
-
-# Install PaddleOCR and other dependencies
+# Install Python dependencies
 RUN pip install --upgrade pip && \
-    pip install --ignore-installed -r submodules/PaddleOCR/requirements.txt && \
     pip install -r requirements.txt
 
-EXPOSE 8000
-
-CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"]
-
-# ============================================
-# Development GPU stage
-# ============================================
-FROM base-gpu as development-gpu
-
-# PaddlePaddle GPU is already installed in the base image
+# Install additional development tools
+RUN pip install ipython ipdb
 
 # Copy application code
 COPY . .
 
-# Install PaddleOCR and other dependencies
-RUN pip install --upgrade pip
-
-# Install compatible numpy/scipy versions that work with sklearn and PaddlePaddle
-RUN pip install numpy==1.26.4 scipy==1.11.4
-
-# Install PaddleOCR requirements
-RUN pip install --ignore-installed -r submodules/PaddleOCR/requirements.txt || true
-
-# Ensure we keep the correct numpy version (PaddleOCR might try to change it)
-RUN pip install --force-reinstall --no-deps numpy==1.26.4
-
-# Install other requirements
-RUN pip install -r requirements_no_version.txt
-
+# Expose port
 EXPOSE 8000
 
+# Run migrations and start development server
 CMD ["sh", "-c", "python manage.py migrate && python manage.py runserver 0.0.0.0:8000"]
 
 # ============================================
-# Production CPU stage
+# Production stage
 # ============================================
-FROM base-cpu as production-cpu
-
-# PaddlePaddle CPU is already installed in the base image
+FROM base as production
 
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
-# Copy application code
-COPY . .
+# Copy requirements
+COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --upgrade pip && \
-    pip install -r submodules/PaddleOCR/requirements.txt && \
     pip install -r requirements.txt && \
     pip install gunicorn==21.2.0
 
-# Create necessary directories with proper permissions
-RUN mkdir -p /app/media /app/staticfiles && \
-    chown -R appuser:appuser /app
-
-# Switch to non-root user
-USER appuser
-
-EXPOSE 8000
-
-# Use gunicorn for production
-CMD ["sh", "-c", "python manage.py collectstatic --noinput && python manage.py migrate && gunicorn image_labeling_backend.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120 --access-logfile - --error-logfile -"]
-
-# ============================================
-# Production GPU stage
-# ============================================
-FROM base-gpu as production-gpu
-
-# PaddlePaddle GPU is already installed in the base image
-
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
-
 # Copy application code
 COPY . .
 
-# Install Python dependencies
-RUN pip install --upgrade pip && \
-    pip install -r submodules/PaddleOCR/requirements.txt && \
-    pip install -r requirements_no_version.txt && \
-    pip install gunicorn==21.2.0
-
 # Create necessary directories with proper permissions
-RUN mkdir -p /app/media /app/staticfiles && \
+RUN mkdir -p /app/media /app/staticfiles /app/logs && \
     chown -R appuser:appuser /app
 
 # Switch to non-root user
 USER appuser
 
+# Expose port
 EXPOSE 8000
 
-# Use gunicorn for production
-CMD ["sh", "-c", "python manage.py collectstatic --noinput && python manage.py migrate && gunicorn image_labeling_backend.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120 --access-logfile - --error-logfile -"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health/ || exit 1
 
-# ============================================
-# Default aliases for backward compatibility
-# ============================================
-FROM development-cpu as development
-FROM production-cpu as production
+# Collect static files, run migrations, and start with gunicorn
+CMD ["sh", "-c", "python manage.py collectstatic --noinput && python manage.py migrate && gunicorn image_labeling_backend.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 120 --access-logfile - --error-logfile -"]
