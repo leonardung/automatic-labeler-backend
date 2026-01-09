@@ -7,6 +7,7 @@ services:
       dockerfile: Dockerfile
       target: ${DOCKER_TARGET:-development-gpu}
     container_name: automatic-labeler-backend
+    shm_size: '4gb'
     volumes:
       - .:/app
       - media_data:/app/media

@@ -292,9 +292,7 @@ def _normalize_resume_payload(
             run_id = entry.get("run_id") or entry.get("id") or entry.get("run")
             if not run_id:
                 continue
-            checkpoint_type = entry.get("checkpoint_type") or entry.get(
-                "checkpoint"
-            )
+            checkpoint_type = entry.get("checkpoint_type") or entry.get("checkpoint")
             normalized[target] = {
                 "run_id": str(run_id),
                 "checkpoint_type": checkpoint_type or "latest",
@@ -326,9 +324,7 @@ def _resolve_resume_checkpoints(
         models_dir = Path(run.models_dir) if run.models_dir else None
         prefix = None
         run_checkpoint = (
-            run.best_checkpoint
-            if checkpoint_type == "best"
-            else run.latest_checkpoint
+            run.best_checkpoint if checkpoint_type == "best" else run.latest_checkpoint
         )
         if run_checkpoint:
             candidate = Path(run_checkpoint)
@@ -1060,7 +1056,7 @@ def _train_model(
         det = dataset_info["det"]
         overrides_list.extend(
             [
-                f"Global.pretrained_model={helper.PRETRAIN_ROOT / 'PP-OCRv5_server_det_pretrained.pdparams'}",
+                f"Global.pretrained_model=https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/PP-OCRv5_server_det_pretrained.pdparams",
                 f"Global.save_model_dir={models_dir}",
                 f"Train.dataset.data_dir={det['data_dir']}",
                 f"Train.dataset.label_file_list=['{det['train_label']}']",
@@ -1073,7 +1069,7 @@ def _train_model(
         rec = dataset_info["rec"]
         overrides_list.extend(
             [
-                f"Global.pretrained_model={helper.PRETRAIN_ROOT / 'latin_PP-OCRv5_mobile_rec_pretrained.pdparams'}",
+                f"Global.pretrained_model=https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/latin_PP-OCRv5_mobile_rec_pretrained.pdparams",
                 f"Global.character_dict_path={helper.PADDLE_ROOT / 'ppocr' / 'utils' / 'dict' / 'ppocrv5_latin_dict.txt'}",
                 f"Global.save_model_dir={models_dir}",
                 f"Train.dataset.data_dir={rec['data_dir']}",
@@ -1129,9 +1125,7 @@ def _train_model(
             resume_path = resume_path.with_suffix("")
         checkpoint_file = resume_path.with_suffix(".pdparams")
         if not checkpoint_file.exists():
-            raise RuntimeError(
-                f"Resume checkpoint not found at {checkpoint_file}."
-            )
+            raise RuntimeError(f"Resume checkpoint not found at {checkpoint_file}.")
         overrides_list.append(f"Global.checkpoints={resume_path.as_posix()}")
 
     model_overrides = overrides.get(target) or {}
